@@ -1,0 +1,793 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const index_1 = require("../index");
+const authMiddleware_1 = require("../middlewares/authMiddleware");
+const fastCache_1 = require("../utils/fastCache");
+const router = (0, express_1.Router)();
+// Get inventory items with FY stats
+router.get('/', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { fyYear } = req.query;
+        const cacheKey = `all_inventory_${fyYear || 'current'}`;
+        const cached = fastCache_1.fastCache.get(cacheKey);
+        if (cached)
+            return res.json(cached);
+        // Determine Financial Year start and end dates
+        const now = new Date();
+        let currentFyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+        const selectedFyYear = fyYear ? parseInt(fyYear, 10) : currentFyYear;
+        const startOfFy = new Date(selectedFyYear, 3, 1); // April 1st
+        const endOfFy = new Date(selectedFyYear + 1, 2, 31, 23, 59, 59, 999); // March 31st
+        let inventory = [];
+        let logsSinceStartOfFy = [];
+        let dbSuccess = false;
+        const mongoose = require('mongoose');
+        let db = mongoose.connection?.db;
+        if (db) {
+            try {
+                const [rawInvs, rawLogs] = await Promise.all([
+                    db.collection('Inventory').find({}).sort({ createdAt: -1 }).toArray(),
+                    db.collection('InventoryLog').find({ createdAt: { $gte: startOfFy } }, { projection: { inventoryId: true, type: true, quantity: true, createdAt: true } }).toArray()
+                ]);
+                const invObjIds = rawInvs.map((i) => i._id);
+                const invStrIds = rawInvs.map((i) => i._id.toString());
+                const allInvLookup = Array.from(new Set([...invObjIds, ...invStrIds]));
+                const [rawMats, rawSlabs] = await Promise.all([
+                    db.collection('ProjectMaterial').find({ inventoryId: { $in: allInvLookup } }).toArray(),
+                    db.collection('Slab').find({ inventoryId: { $in: allInvLookup } }).toArray()
+                ]);
+                const allProjIds = Array.from(new Set([
+                    ...rawMats.map((m) => m.projectId?.toString()),
+                    ...rawSlabs.map((s) => s.projectId?.toString())
+                ].filter(Boolean)));
+                const projObjIds = allProjIds
+                    .filter((pId) => mongoose.Types.ObjectId.isValid(pId))
+                    .map((pId) => new mongoose.Types.ObjectId(pId));
+                const rawProjects = await db.collection('Project').find({ $or: [{ _id: { $in: projObjIds } }, { id: { $in: allProjIds } }] }, { projection: { name: 1, projectId: 1, clientName: 1 } }).toArray();
+                const projMap = new Map();
+                rawProjects.forEach((p) => {
+                    projMap.set(p._id.toString(), {
+                        id: p._id.toString(),
+                        name: p.name,
+                        projectId: p.projectId,
+                        clientName: p.clientName
+                    });
+                });
+                const matMap = new Map();
+                rawMats.forEach((m) => {
+                    const invKey = m.inventoryId?.toString();
+                    const pKey = m.projectId?.toString();
+                    if (!matMap.has(invKey))
+                        matMap.set(invKey, []);
+                    matMap.get(invKey).push({
+                        id: m._id.toString(),
+                        projectId: pKey,
+                        quantity: m.quantity,
+                        project: projMap.get(pKey) || null
+                    });
+                });
+                const slabMap = new Map();
+                rawSlabs.forEach((s) => {
+                    const invKey = s.inventoryId?.toString();
+                    const pKey = s.projectId?.toString();
+                    if (!slabMap.has(invKey))
+                        slabMap.set(invKey, []);
+                    slabMap.get(invKey).push({
+                        id: s._id.toString(),
+                        name: s.name,
+                        projectId: pKey,
+                        project: projMap.get(pKey) || null
+                    });
+                });
+                inventory = rawInvs.map((inv) => ({
+                    ...inv,
+                    id: inv._id.toString(),
+                    projectMaterials: matMap.get(inv._id.toString()) || [],
+                    slabs: slabMap.get(inv._id.toString()) || []
+                }));
+                logsSinceStartOfFy = rawLogs.map((l) => ({
+                    ...l,
+                    id: l._id.toString(),
+                    createdAt: new Date(l.createdAt)
+                }));
+                dbSuccess = true;
+            }
+            catch (mErr) {
+                console.warn('Mongoose inventory fetch failed:', mErr);
+            }
+        }
+        if (!dbSuccess) {
+            const [prismaInv, prismaLogs] = await Promise.all([
+                index_1.prisma.inventory.findMany({
+                    orderBy: { createdAt: 'desc' },
+                    include: {
+                        projectMaterials: {
+                            include: {
+                                project: {
+                                    select: { id: true, name: true, projectId: true, clientName: true }
+                                }
+                            }
+                        },
+                        slabs: {
+                            include: {
+                                project: {
+                                    select: { id: true, name: true, projectId: true, clientName: true }
+                                }
+                            }
+                        }
+                    }
+                }),
+                index_1.prisma.inventoryLog.findMany({
+                    where: { createdAt: { gte: startOfFy } },
+                    select: { inventoryId: true, type: true, quantity: true, createdAt: true }
+                })
+            ]);
+            inventory = prismaInv;
+            logsSinceStartOfFy = prismaLogs;
+        }
+        // Fast O(1) aggregation Maps
+        const netChangeMap = new Map();
+        const inQtyMap = new Map();
+        const outQtyMap = new Map();
+        const endOfFyTime = endOfFy.getTime();
+        for (const log of logsSinceStartOfFy) {
+            const net = netChangeMap.get(log.inventoryId) || 0;
+            netChangeMap.set(log.inventoryId, net + (log.type === 'IN' ? log.quantity : -log.quantity));
+            if (log.createdAt.getTime() <= endOfFyTime) {
+                if (log.type === 'IN') {
+                    inQtyMap.set(log.inventoryId, (inQtyMap.get(log.inventoryId) || 0) + log.quantity);
+                }
+                else if (log.type === 'OUT') {
+                    outQtyMap.set(log.inventoryId, (outQtyMap.get(log.inventoryId) || 0) + log.quantity);
+                }
+            }
+        }
+        const enrichedInventory = inventory.map(item => {
+            const netChangeSinceStartOfFy = netChangeMap.get(item.id) || 0;
+            const openingStock = item.quantity - netChangeSinceStartOfFy;
+            const inQty = inQtyMap.get(item.id) || 0;
+            const outQty = outQtyMap.get(item.id) || 0;
+            return {
+                ...item,
+                openingStock,
+                inCurrentFY: inQty,
+                outCurrentFY: outQty,
+                closingStock: openingStock + inQty - outQty
+            };
+        });
+        fastCache_1.fastCache.set(cacheKey, enrichedInventory, 120);
+        res.json(enrichedInventory);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Server error fetching inventory' });
+    }
+});
+// Add new inventory item
+router.post('/', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { type, jobWorkType, itemName, blockNumber, thickness, length, width, height, weight, quantity, unit, supplier, costPerUnit } = req.body;
+        const newItem = await index_1.prisma.inventory.create({
+            data: {
+                type,
+                jobWorkType: jobWorkType || 'company',
+                itemName,
+                blockNumber,
+                thickness: thickness ? Number(thickness) : null,
+                length: length ? Number(length) : null,
+                width: width ? Number(width) : null,
+                height: height ? Number(height) : null,
+                weight: weight ? Number(weight) : null,
+                quantity: Number(quantity),
+                unit,
+                supplier,
+                costPerUnit: costPerUnit ? Number(costPerUnit) : 0
+            }
+        });
+        // Create initial InventoryLog
+        if (Number(quantity) > 0) {
+            await index_1.prisma.inventoryLog.create({
+                data: {
+                    inventoryId: newItem.id,
+                    type: 'IN',
+                    quantity: Number(quantity),
+                    remarks: 'Initial stock addition'
+                }
+            });
+        }
+        fastCache_1.fastCache.invalidate('all_inventory');
+        res.status(201).json(newItem);
+    }
+    catch (error) {
+        console.error('Error creating inventory item:', error);
+        res.status(500).json({ message: 'Server error creating inventory item' });
+    }
+});
+// Update stock (in/out)
+router.patch('/:id/stock', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { quantityChange, remarks } = req.body; // positive for IN, negative for OUT
+        const item = await index_1.prisma.inventory.findUnique({ where: { id: String(id) } });
+        if (!item)
+            return res.status(404).json({ message: 'Item not found' });
+        // Update inventory quantity
+        const updatedItem = await index_1.prisma.inventory.update({
+            where: { id: String(id) },
+            data: { quantity: item.quantity + Number(quantityChange) }
+        });
+        // Create InventoryLog
+        await index_1.prisma.inventoryLog.create({
+            data: {
+                inventoryId: String(id),
+                type: Number(quantityChange) >= 0 ? 'IN' : 'OUT',
+                quantity: Math.abs(Number(quantityChange)),
+                remarks: remarks || 'Manual stock update'
+            }
+        });
+        res.json(updatedItem);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Server error updating stock' });
+    }
+});
+// Get logs by inventory item ID
+router.get('/item-logs/:inventoryId', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { inventoryId } = req.params;
+        const item = await index_1.prisma.inventory.findUnique({
+            where: { id: String(inventoryId) },
+            include: {
+                projectMaterials: {
+                    include: {
+                        project: true
+                    }
+                },
+                slabs: {
+                    include: {
+                        project: true
+                    }
+                }
+            }
+        });
+        const rawLogs = await index_1.prisma.inventoryLog.findMany({
+            where: { inventoryId: String(inventoryId) },
+            orderBy: { createdAt: 'asc' }, // Ascending to calculate balance easily
+            include: {
+                inventory: {
+                    select: { id: true, itemName: true, blockNumber: true, length: true, width: true, thickness: true, unit: true, quantity: true, supplier: true }
+                }
+            }
+        });
+        // Deduplicate accidental duplicate OUT logs for the exact same [Piece:...] or identical remarks + quantity
+        const seenOutKeys = new Set();
+        const logs = [];
+        let restoredQty = 0;
+        const duplicateIdsToDelete = [];
+        for (const l of rawLogs) {
+            if (l.type === 'OUT' && l.remarks) {
+                const pieceMatch = l.remarks.match(/\[Piece:([a-f\d]{24})\]/i);
+                const dedupKey = pieceMatch
+                    ? `piece_${pieceMatch[1]}`
+                    : `rem_${l.remarks.trim()}_${Number(l.quantity).toFixed(2)}`;
+                if (seenOutKeys.has(dedupKey)) {
+                    duplicateIdsToDelete.push(l.id);
+                    restoredQty += Number(l.quantity) || 0;
+                    continue;
+                }
+                seenOutKeys.add(dedupKey);
+            }
+            logs.push(l);
+        }
+        if (duplicateIdsToDelete.length > 0 && item) {
+            await index_1.prisma.inventoryLog.deleteMany({ where: { id: { in: duplicateIdsToDelete } } }).catch(() => { });
+            const correctedQty = (item.quantity || 0) + restoredQty;
+            await index_1.prisma.inventory.update({
+                where: { id: item.id },
+                data: { quantity: correctedQty }
+            }).catch(() => { });
+            item.quantity = correctedQty;
+            fastCache_1.fastCache.clearAll();
+        }
+        res.json({ item, logs });
+    }
+    catch (error) {
+        console.error('Error fetching item logs:', error);
+        res.status(500).json({ message: 'Server error fetching item logs' });
+    }
+});
+// Get logs by supplier
+router.get('/logs/:supplier', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { supplier } = req.params;
+        // Find all inventory items for this supplier or project
+        const inventoryItems = await index_1.prisma.inventory.findMany({
+            where: {
+                OR: [
+                    { supplier: { equals: String(supplier), mode: 'insensitive' } },
+                    ...(String(supplier).toLowerCase().includes('unnati') ? [{ supplier: { equals: 'Unnati Arts', mode: 'insensitive' } }] : []),
+                    {
+                        projectMaterials: {
+                            some: {
+                                project: {
+                                    OR: [
+                                        { name: { equals: String(supplier), mode: 'insensitive' } },
+                                        { projectId: { equals: String(supplier), mode: 'insensitive' } },
+                                        { clientName: { equals: String(supplier), mode: 'insensitive' } }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    {
+                        slabs: {
+                            some: {
+                                project: {
+                                    OR: [
+                                        { name: { equals: String(supplier), mode: 'insensitive' } },
+                                        { projectId: { equals: String(supplier), mode: 'insensitive' } },
+                                        { clientName: { equals: String(supplier), mode: 'insensitive' } }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            select: { id: true, itemName: true, blockNumber: true, length: true, width: true, thickness: true, unit: true, supplier: true }
+        });
+        const inventoryIds = inventoryItems.map(i => i.id);
+        // Get all logs for those items
+        const logs = await index_1.prisma.inventoryLog.findMany({
+            where: { inventoryId: { in: inventoryIds } },
+            orderBy: { createdAt: 'desc' }
+        });
+        // Map logs to include inventory details
+        const logsWithDetails = logs.map(log => {
+            const item = inventoryItems.find(i => i.id === log.inventoryId);
+            return {
+                ...log,
+                inventory: item
+            };
+        });
+        res.json(logsWithDetails);
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Server error fetching logs' });
+    }
+});
+// Manual deduct stock (and optional waste)
+router.post('/deduct', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { inventoryId, usedQuantity, wasteQuantity, projectName, projectId, slabId, pieceId, pieceName, length, width, thickness, unit, date } = req.body;
+        const used = Number(usedQuantity) || 0;
+        const waste = Number(wasteQuantity) || 0;
+        const totalDeduct = used + waste;
+        if (!inventoryId || totalDeduct <= 0) {
+            return res.status(400).json({ message: 'Invalid quantities' });
+        }
+        const item = await index_1.prisma.inventory.findUnique({ where: { id: inventoryId } });
+        if (!item)
+            return res.status(404).json({ message: 'Item not found' });
+        // We allow deducting more than available if they really want, but let's check
+        if (item.quantity < totalDeduct) {
+            return res.status(400).json({ message: 'Not enough stock available' });
+        }
+        // Update inventory quantity
+        await index_1.prisma.inventory.update({
+            where: { id: inventoryId },
+            data: { quantity: item.quantity - totalDeduct }
+        });
+        // Link Piece to this Inventory Item via ProjectMaterial
+        let targetProjectId = projectId;
+        if (pieceId) {
+            const piece = await index_1.prisma.piece.findUnique({
+                where: { id: pieceId },
+                include: { slab: true }
+            });
+            if (piece) {
+                targetProjectId = targetProjectId || piece.slab?.projectId;
+                if (targetProjectId) {
+                    let projMat = await index_1.prisma.projectMaterial.findFirst({
+                        where: {
+                            projectId: targetProjectId,
+                            inventoryId: inventoryId
+                        }
+                    });
+                    if (!projMat) {
+                        projMat = await index_1.prisma.projectMaterial.create({
+                            data: {
+                                projectId: targetProjectId,
+                                inventoryId: inventoryId,
+                                quantity: used,
+                                usedQuantity: used,
+                                cost: 0
+                            }
+                        });
+                    }
+                    else {
+                        projMat = await index_1.prisma.projectMaterial.update({
+                            where: { id: projMat.id },
+                            data: {
+                                quantity: (projMat.quantity || 0) + used,
+                                usedQuantity: (projMat.usedQuantity || 0) + used
+                            }
+                        });
+                    }
+                    let usedSizeStr = null;
+                    if (length && width) {
+                        const l = Number(length) || 0;
+                        const w = Number(width) || 0;
+                        const t = thickness ? ` | ${thickness}MM` : '';
+                        const sqFtStr = used > 0 ? ` | ${used.toFixed(2)} Sq.Ft` : '';
+                        if (unit === 'feet') {
+                            usedSizeStr = `${l}ft x ${w}ft${t}${sqFtStr}`;
+                        }
+                        else if (unit === 'mm') {
+                            usedSizeStr = `${l}mm x ${w}mm${t}${sqFtStr}`;
+                        }
+                        else {
+                            usedSizeStr = `${l}" x ${w}"${t}${sqFtStr}`;
+                        }
+                    }
+                    await index_1.prisma.piece.update({
+                        where: { id: pieceId },
+                        data: {
+                            sourceMaterialId: projMat.id,
+                            vendorName: usedSizeStr
+                        }
+                    });
+                }
+            }
+        }
+        if (slabId) {
+            await index_1.prisma.slab.update({
+                where: { id: slabId },
+                data: { inventoryId: inventoryId }
+            }).catch(() => { });
+        }
+        const createdAt = date ? new Date(date) : new Date();
+        let cleanProjName = (projectName || '').replace(/\s*\(\d+(?:\.\d+)?\s*L?\s*[xX]\s*\d+(?:\.\d+)?\s*W?[^)]*\)/gi, '').trim();
+        let cleanPieceName = (pieceName || '')
+            .replace(/\s*\(\d+(?:\.\d+)?\s*(?:mm|ft|in|L)?[xX×]\s*\d+(?:\.\d+)?\s*(?:mm|ft|in|W)?[^)]*\)/gi, '')
+            .replace(/\s*\([^)]*Sq\.?Ft[^)]*\)/gi, '')
+            .trim();
+        let outRemarks = cleanProjName ? `${cleanProjName}${cleanPieceName ? ` (${cleanPieceName})` : ''}` : 'Manual Deduction';
+        if (pieceId) {
+            outRemarks = `[Piece:${pieceId}] ${outRemarks}`;
+        }
+        else if (slabId) {
+            outRemarks = `[Slab:${slabId}] ${outRemarks}`;
+        }
+        if (length && width) {
+            const l = Number(length) || 0;
+            const w = Number(width) || 0;
+            const t = thickness ? ` | ${thickness}MM` : '';
+            if (unit === 'feet') {
+                outRemarks += ` (${l}ft x ${w}ft${t} | ${used.toFixed(2)} Sq.Ft)`;
+            }
+            else if (unit === 'mm') {
+                outRemarks += ` (${l}mm x ${w}mm${t} | ${used.toFixed(2)} Sq.Ft)`;
+            }
+            else {
+                outRemarks += ` (${l}" x ${w}"${t} | ${used.toFixed(2)} Sq.Ft)`;
+            }
+        }
+        // Create OUT log for Used (or update existing if already deducted for the same pieceId to prevent duplicates)
+        if (used > 0) {
+            const existingOutLog = pieceId
+                ? await index_1.prisma.inventoryLog.findFirst({
+                    where: {
+                        inventoryId: inventoryId,
+                        type: 'OUT',
+                        remarks: { contains: `[Piece:${pieceId}]` }
+                    }
+                })
+                : null;
+            if (existingOutLog) {
+                // Restore previously deducted quantity and apply new used quantity
+                const diff = used - (existingOutLog.quantity || 0);
+                await index_1.prisma.inventory.update({
+                    where: { id: inventoryId },
+                    data: { quantity: item.quantity - diff }
+                });
+                await index_1.prisma.inventoryLog.update({
+                    where: { id: existingOutLog.id },
+                    data: {
+                        quantity: used,
+                        remarks: outRemarks,
+                        createdAt: createdAt
+                    }
+                });
+            }
+            else {
+                await index_1.prisma.inventoryLog.create({
+                    data: {
+                        inventoryId: inventoryId,
+                        type: 'OUT',
+                        quantity: used,
+                        remarks: outRemarks,
+                        createdAt: createdAt
+                    }
+                });
+            }
+        }
+        // Create OUT log for Waste
+        if (waste > 0) {
+            await index_1.prisma.inventoryLog.create({
+                data: {
+                    inventoryId: inventoryId,
+                    type: 'OUT',
+                    quantity: waste,
+                    remarks: 'Waste',
+                    createdAt: createdAt
+                }
+            });
+        }
+        fastCache_1.fastCache.clearAll();
+        res.json({ message: 'Stock deducted successfully' });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error deducting stock' });
+    }
+});
+// Edit log
+router.put('/logs/:id', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { quantity, remarks, date } = req.body;
+        const log = await index_1.prisma.inventoryLog.findUnique({ where: { id } });
+        if (!log)
+            return res.status(404).json({ message: 'Log not found' });
+        const updateData = {};
+        if (remarks !== undefined)
+            updateData.remarks = remarks;
+        if (date !== undefined)
+            updateData.createdAt = new Date(date);
+        if (quantity !== undefined && Number(quantity) !== log.quantity) {
+            const newQty = Number(quantity);
+            const diff = newQty - log.quantity;
+            const inventory = await index_1.prisma.inventory.findUnique({ where: { id: log.inventoryId } });
+            if (inventory) {
+                if (log.type === 'OUT') {
+                    // If we increase OUT (diff > 0), we SUBTRACT from inventory stock
+                    // If we decrease OUT (diff < 0), we ADD back to inventory stock
+                    if (inventory.quantity - diff < 0) {
+                        return res.status(400).json({ message: 'Not enough stock available for this edit' });
+                    }
+                    await index_1.prisma.inventory.update({
+                        where: { id: inventory.id },
+                        data: { quantity: inventory.quantity - diff }
+                    });
+                }
+                else if (log.type === 'IN') {
+                    // If we increase IN (diff > 0), we ADD to inventory stock
+                    // If we decrease IN (diff < 0), we SUBTRACT from inventory stock
+                    await index_1.prisma.inventory.update({
+                        where: { id: inventory.id },
+                        data: { quantity: inventory.quantity + diff }
+                    });
+                }
+            }
+            updateData.quantity = newQty;
+        }
+        const updated = await index_1.prisma.inventoryLog.update({
+            where: { id },
+            data: updateData
+        });
+        fastCache_1.fastCache.clearAll();
+        res.json(updated);
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error updating log' });
+    }
+});
+// Delete log
+router.delete('/logs/:id', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const log = await index_1.prisma.inventoryLog.findUnique({ where: { id } });
+        if (!log)
+            return res.status(404).json({ message: 'Log not found' });
+        const inventory = await index_1.prisma.inventory.findUnique({ where: { id: log.inventoryId } });
+        if (inventory) {
+            if (log.type === 'OUT') {
+                // Restore stock
+                await index_1.prisma.inventory.update({
+                    where: { id: inventory.id },
+                    data: { quantity: inventory.quantity + log.quantity }
+                });
+                // Clear piece allocation if no remaining OUT logs or if piece was linked
+                try {
+                    const linkedProjMats = await index_1.prisma.projectMaterial.findMany({
+                        where: { inventoryId: log.inventoryId },
+                        select: { id: true, projectId: true }
+                    });
+                    const projMatIds = linkedProjMats.map(pm => pm.id);
+                    const remainingOutLogs = await index_1.prisma.inventoryLog.count({
+                        where: {
+                            inventoryId: log.inventoryId,
+                            type: 'OUT',
+                            id: { not: id }
+                        }
+                    });
+                    if (remainingOutLogs === 0 && (projMatIds.length > 0 || log.inventoryId)) {
+                        await index_1.prisma.piece.updateMany({
+                            where: {
+                                OR: [
+                                    ...(projMatIds.length > 0 ? [{ sourceMaterialId: { in: projMatIds } }] : []),
+                                    { sourceMaterialId: log.inventoryId }
+                                ]
+                            },
+                            data: {
+                                sourceMaterialId: null,
+                                vendorName: null
+                            }
+                        });
+                    }
+                }
+                catch (unlinkProjErr) {
+                    console.error('Error clearing piece allocation on inventory log delete:', unlinkProjErr);
+                }
+                // 1. Unlink piece if log remarks contained piece or slab info
+                if (log.remarks) {
+                    const idMatch = log.remarks.match(/\[Piece:([a-f\d]{24})\]/i);
+                    const taggedPieceId = (idMatch && idMatch[1]) ? idMatch[1].trim() : '';
+                    const slabIdMatch = log.remarks.match(/\[Slab:([a-f\d]{24})\]/i);
+                    const taggedSlabId = (slabIdMatch && slabIdMatch[1]) ? slabIdMatch[1].trim() : '';
+                    let targetProjectId = null;
+                    let affectedSlabId = taggedSlabId || null;
+                    if (taggedPieceId) {
+                        try {
+                            const p = await index_1.prisma.piece.findUnique({
+                                where: { id: taggedPieceId },
+                                include: { slab: true }
+                            });
+                            if (p) {
+                                targetProjectId = p.slab?.projectId || null;
+                                affectedSlabId = p.slabId || affectedSlabId;
+                                await index_1.prisma.piece.update({
+                                    where: { id: taggedPieceId },
+                                    data: { sourceMaterialId: null, vendorName: null }
+                                });
+                            }
+                        }
+                        catch (e) {
+                            console.error('Error unlinking tagged piece:', e);
+                        }
+                    }
+                    else if (taggedSlabId) {
+                        try {
+                            const s = await index_1.prisma.slab.findUnique({
+                                where: { id: taggedSlabId },
+                                include: { pieces: true }
+                            });
+                            if (s) {
+                                targetProjectId = s.projectId || null;
+                                await index_1.prisma.piece.updateMany({
+                                    where: { slabId: taggedSlabId },
+                                    data: { sourceMaterialId: null, vendorName: null }
+                                });
+                            }
+                        }
+                        catch (e) {
+                            console.error('Error unlinking tagged slab pieces:', e);
+                        }
+                    }
+                    else {
+                        // Only check brackets if no taggedPieceId or taggedSlabId
+                        const bracketMatches = Array.from(log.remarks.matchAll(/\(([^)]+)\)/g));
+                        for (const m of bracketMatches) {
+                            const inside = (m && m[1]) ? m[1].trim() : '';
+                            if (inside && !inside.includes('Sq.Ft') && !inside.includes('ft') && !inside.includes('mm') && !inside.includes('"')) {
+                                try {
+                                    const p = await index_1.prisma.piece.findFirst({
+                                        where: { productName: inside },
+                                        include: { slab: true }
+                                    });
+                                    if (p) {
+                                        targetProjectId = p.slab?.projectId || null;
+                                        affectedSlabId = p.slabId || null;
+                                        await index_1.prisma.piece.update({
+                                            where: { id: p.id },
+                                            data: { sourceMaterialId: null, vendorName: null }
+                                        });
+                                        break;
+                                    }
+                                    const s = await index_1.prisma.slab.findFirst({
+                                        where: { name: inside },
+                                        include: { pieces: true }
+                                    });
+                                    if (s) {
+                                        targetProjectId = s.projectId || null;
+                                        affectedSlabId = s.id;
+                                        await index_1.prisma.piece.updateMany({
+                                            where: { slabId: s.id },
+                                            data: { sourceMaterialId: null, vendorName: null }
+                                        });
+                                        break;
+                                    }
+                                }
+                                catch (e) {
+                                    console.error('Error finding piece by name:', e);
+                                }
+                            }
+                        }
+                    }
+                    // If a slab was affected, check if any pieces under it still have allocated raw material
+                    if (affectedSlabId) {
+                        try {
+                            const piecesOfSlab = await index_1.prisma.piece.findMany({
+                                where: { slabId: affectedSlabId }
+                            });
+                            const stillAllocated = piecesOfSlab.some(p => p.sourceMaterialId || p.vendorName);
+                            if (!stillAllocated) {
+                                await index_1.prisma.slab.update({
+                                    where: { id: affectedSlabId },
+                                    data: { inventoryId: null }
+                                }).catch(() => { });
+                            }
+                        }
+                        catch (err) {
+                            console.error('Error clearing slab inventoryId:', err);
+                        }
+                    }
+                    // 2. Decrement ProjectMaterial quantity and usedQuantity for this inventory item
+                    try {
+                        const pmWhere = { inventoryId: log.inventoryId };
+                        if (targetProjectId) {
+                            pmWhere.projectId = targetProjectId;
+                        }
+                        const projMats = await index_1.prisma.projectMaterial.findMany({ where: pmWhere });
+                        for (const pm of projMats) {
+                            const newUsed = Math.max(0, (pm.usedQuantity || 0) - log.quantity);
+                            const newQty = Math.max(0, (pm.quantity || 0) - log.quantity);
+                            if (newQty <= 0) {
+                                // Only unlink pieces if this PM is truly deleted
+                                const remainingPieces = await index_1.prisma.piece.count({
+                                    where: { sourceMaterialId: pm.id }
+                                });
+                                if (remainingPieces === 0) {
+                                    await index_1.prisma.projectMaterial.delete({ where: { id: pm.id } }).catch(() => { });
+                                }
+                                else {
+                                    await index_1.prisma.projectMaterial.update({
+                                        where: { id: pm.id },
+                                        data: { usedQuantity: 0, quantity: 0 }
+                                    });
+                                }
+                            }
+                            else {
+                                await index_1.prisma.projectMaterial.update({
+                                    where: { id: pm.id },
+                                    data: { usedQuantity: newUsed, quantity: newQty }
+                                });
+                            }
+                        }
+                    }
+                    catch (pmErr) {
+                        console.error('Error updating projectMaterial on log delete:', pmErr);
+                    }
+                }
+            }
+            else if (log.type === 'IN') {
+                // Remove stock
+                await index_1.prisma.inventory.update({
+                    where: { id: inventory.id },
+                    data: { quantity: inventory.quantity - log.quantity }
+                });
+            }
+        }
+        await index_1.prisma.inventoryLog.delete({ where: { id } });
+        fastCache_1.fastCache.clearAll();
+        res.json({ message: 'Log deleted successfully' });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error deleting log' });
+    }
+});
+exports.default = router;
+//# sourceMappingURL=inventoryRoutes.js.map

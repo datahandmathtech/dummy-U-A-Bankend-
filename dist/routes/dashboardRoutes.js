@@ -1,0 +1,209 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const index_1 = require("../index");
+const authMiddleware_1 = require("../middlewares/authMiddleware");
+const fastCache_1 = require("../utils/fastCache");
+const router = (0, express_1.Router)();
+router.get('/summary', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { fy, month } = req.query;
+        const cacheKey = `dashboard_summary_${fy || 'all'}_${month || 'all'}`;
+        const cached = fastCache_1.fastCache.get(cacheKey);
+        if (cached)
+            return res.json(cached);
+        let prismaDateFilter = {};
+        let mongoDateFilter = {};
+        let prismaExpenseFilter = {};
+        let mongoExpenseFilter = {};
+        if (fy && typeof fy === 'string') {
+            const startYear = parseInt(fy.split('-')[0]);
+            const endYear = parseInt(fy.split('-')[1]);
+            let startDate, endDate;
+            if (month && month !== '') {
+                const monthNum = parseInt(month);
+                const year = (monthNum >= 3 && monthNum <= 11) ? startYear : endYear;
+                startDate = new Date(year, monthNum, 1);
+                endDate = new Date(year, monthNum + 1, 0, 23, 59, 59, 999);
+            }
+            else {
+                startDate = new Date(startYear, 3, 1);
+                endDate = new Date(endYear, 2, 31, 23, 59, 59, 999);
+            }
+            prismaDateFilter = {
+                createdAt: {
+                    gte: startDate,
+                    lte: endDate
+                }
+            };
+            mongoDateFilter = {
+                createdAt: {
+                    $gte: startDate,
+                    $lte: endDate
+                }
+            };
+            prismaExpenseFilter = { date: prismaDateFilter.createdAt };
+            mongoExpenseFilter = {
+                $or: [
+                    { date: mongoDateFilter.createdAt },
+                    { createdAt: mongoDateFilter.createdAt }
+                ]
+            };
+        }
+        let projects = [];
+        let invoices = [];
+        let laborContracts = [];
+        let expenses = [];
+        let electricity = [];
+        const mongoose = require('mongoose');
+        let db = mongoose.connection?.db;
+        let dbSuccess = false;
+        if (db) {
+            try {
+                [projects, invoices, laborContracts, expenses, electricity] = await Promise.all([
+                    db.collection('Project').find(mongoDateFilter, { projection: { status: 1 } }).toArray(),
+                    db.collection('Invoice').find(mongoDateFilter, { projection: { totalAmount: 1, advancePaid: 1, balanceAmount: 1 } }).toArray(),
+                    db.collection('LaborContract').find(mongoDateFilter, { projection: { totalAmount: 1 } }).toArray(),
+                    db.collection('Expense').find(mongoExpenseFilter, { projection: { amount: 1 } }).toArray(),
+                    db.collection('ElectricityLog').find({}, { projection: { month: 1, totalBill: 1 } }).toArray()
+                ]);
+                dbSuccess = true;
+            }
+            catch (mErr) {
+                console.warn('Mongoose dashboard query failed, falling back to Prisma:', mErr);
+            }
+        }
+        if (!dbSuccess) {
+            [projects, invoices, laborContracts, expenses, electricity] = await Promise.all([
+                index_1.prisma.project.findMany({ where: prismaDateFilter, select: { status: true } }),
+                index_1.prisma.invoice.findMany({ where: prismaDateFilter, select: { totalAmount: true, advancePaid: true, balanceAmount: true } }),
+                index_1.prisma.laborContract.findMany({ where: prismaDateFilter, select: { totalAmount: true } }),
+                index_1.prisma.expense.findMany({ where: prismaExpenseFilter, select: { amount: true } }),
+                index_1.prisma.electricityLog.findMany({ select: { month: true, totalBill: true } })
+            ]);
+        }
+        let totalLeads = 0;
+        let activeProjects = 0;
+        let pendingQuotations = 0;
+        let readyForDispatch = 0;
+        let completedProjects = 0;
+        for (const p of projects) {
+            if (['enquiry', 'design_sharing', 'quotation', 'advance_payment'].includes(p.status))
+                totalLeads++;
+            if (['shop_drawing', 'material_planning', 'production', 'work_order'].includes(p.status))
+                activeProjects++;
+            if (p.status === 'quotation')
+                pendingQuotations++;
+            if (p.status === 'completed') {
+                readyForDispatch++;
+                completedProjects++;
+            }
+        }
+        const totalRevenue = invoices.reduce((acc, curr) => acc + (curr.totalAmount || 0), 0);
+        const advancePaidTotal = invoices.reduce((acc, curr) => acc + (curr.advancePaid || 0), 0);
+        const pendingInvoicesTotal = invoices.reduce((acc, curr) => acc + (curr.balanceAmount || 0), 0);
+        const laborCost = laborContracts.reduce((acc, curr) => acc + (curr.totalAmount || 0), 0);
+        const factoryExpenses = expenses.reduce((acc, curr) => acc + (curr.amount || 0), 0);
+        // Calculate Petty Cash in hand from CashTransaction (synced with Cash Book)
+        let pettyCashInHand = 0;
+        try {
+            let cashTransactions = [];
+            if (db) {
+                cashTransactions = await db.collection('CashTransaction').find({}).toArray();
+            }
+            else {
+                cashTransactions = await index_1.prisma.cashTransaction.findMany();
+            }
+            if (cashTransactions && cashTransactions.length > 0) {
+                const inSum = cashTransactions.filter((c) => c.type === 'IN').reduce((acc, c) => acc + (Number(c.amount) || 0), 0);
+                const outSum = cashTransactions.filter((c) => c.type === 'OUT').reduce((acc, c) => acc + (Number(c.amount) || 0), 0);
+                pettyCashInHand = inSum - outSum;
+            }
+        }
+        catch (e) {
+            console.warn('Failed to query CashTransaction:', e);
+        }
+        // Calculate Material Inward / Outward for current month (in piece quantity)
+        const nowMonthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+        let materialLogs = [];
+        try {
+            if (db) {
+                materialLogs = await db.collection('ProductionLog').find({ createdAt: { $gte: nowMonthStart } }).toArray();
+            }
+            else {
+                materialLogs = await index_1.prisma.productionLog.findMany({ where: { createdAt: { gte: nowMonthStart } } });
+            }
+        }
+        catch (e) {
+            console.warn('Failed to query ProductionLog for month material:', e);
+        }
+        let outwardSum = 0;
+        let inwardSum = 0;
+        for (const log of materialLogs) {
+            const qty = Math.round(Number(log.quantityProduced) || 0);
+            if (log.transactionType === 'OUT')
+                outwardSum += qty;
+            else if (log.transactionType === 'IN')
+                inwardSum += qty;
+        }
+        const materialOutwardMonth = outwardSum;
+        const materialInwardMonth = inwardSum;
+        const filteredElec = electricity.filter(e => {
+            if (!fy)
+                return true;
+            const eYear = parseInt(e.month.split('-')[0]);
+            const eMonth = parseInt(e.month.split('-')[1]) - 1; // 0-11
+            const startYear = parseInt(fy.split('-')[0]);
+            const endYear = parseInt(fy.split('-')[1]);
+            if (month && month !== '') {
+                return eYear === ((parseInt(month) >= 3 && parseInt(month) <= 11) ? startYear : endYear) && eMonth === parseInt(month);
+            }
+            if (eMonth >= 3)
+                return eYear === startYear;
+            return eYear === endYear;
+        });
+        const electricityCost = filteredElec.reduce((acc, curr) => acc + (curr.totalBill || 0), 0);
+        const netProfit = totalRevenue - (laborCost + factoryExpenses + electricityCost);
+        const summaryData = {
+            totalLeads,
+            activeProjects,
+            completedProjects,
+            totalOrders: activeProjects + completedProjects,
+            pendingQuotations,
+            readyForDispatch,
+            totalRevenue,
+            advancePaidTotal,
+            pendingInvoicesTotal,
+            pettyCashInHand,
+            materialOutwardMonth,
+            materialInwardMonth,
+            factoryExpenses,
+            profitability: {
+                totalRevenue,
+                laborCost,
+                factoryExpenses,
+                electricityCost,
+                netProfit
+            }
+        };
+        fastCache_1.fastCache.set(cacheKey, summaryData, 30);
+        res.json(summaryData);
+    }
+    catch (error) {
+        console.error('Dashboard summary error:', error);
+        res.status(500).json({ message: 'Server error fetching dashboard summary', error: error.message });
+    }
+});
+// A simple mock for downloading reports
+router.get('/export/:type', authMiddleware_1.authenticate, async (req, res) => {
+    try {
+        const { type } = req.params;
+        // In a real app, generate PDF/Excel using pdfmake or exceljs here and return buffer
+        res.json({ message: `Export for ${type} generated successfully (Mock)` });
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Server error exporting data' });
+    }
+});
+exports.default = router;
+//# sourceMappingURL=dashboardRoutes.js.map
