@@ -8,13 +8,21 @@ import { PrismaClient } from '@prisma/client';
 
 dotenv.config();
 
-const standardUri = 'mongodb://yatree_admin:Mayank123@ac-n3u3fkt-shard-00-00.iuq9w0n.mongodb.net:27017,ac-n3u3fkt-shard-00-01.iuq9w0n.mongodb.net:27017,ac-n3u3fkt-shard-00-02.iuq9w0n.mongodb.net:27017/Unnati-arts?ssl=true&replicaSet=atlas-icn4hi-shard-0&authSource=admin&retryWrites=true&w=majority&readPreference=primary&connectTimeoutMS=10000&socketTimeoutMS=20000&serverSelectionTimeoutMS=5000&maxIdleTimeMS=10000';
-let effectiveDbUrl = process.env.DATABASE_URL || process.env.MONGO_URI || standardUri;
+const defaultClusterBase = 'mongodb://yatree_admin:Mayank123@ac-n3u3fkt-shard-00-00.iuq9w0n.mongodb.net:27017,ac-n3u3fkt-shard-00-01.iuq9w0n.mongodb.net:27017,ac-n3u3fkt-shard-00-02.iuq9w0n.mongodb.net:27017';
+const defaultParams = 'ssl=true&replicaSet=atlas-icn4hi-shard-0&authSource=admin&retryWrites=true&w=majority&readPreference=primary&connectTimeoutMS=10000&socketTimeoutMS=20000&serverSelectionTimeoutMS=5000&maxIdleTimeMS=10000';
 
-// If env var is missing or contains old SRV string, use the resilient direct replica set URI
-if (!effectiveDbUrl || effectiveDbUrl.startsWith('mongodb+srv://') || effectiveDbUrl.includes('cluster0.') || effectiveDbUrl.includes('maxPoolSize') || !effectiveDbUrl.includes('serverSelectionTimeoutMS')) {
-  effectiveDbUrl = standardUri;
+let rawUrl = (process.env.DATABASE_URL || process.env.MONGO_URI || '').trim();
+let dbName = 'Unnati-Fresh-DB';
+
+if (rawUrl) {
+  const dbMatch = rawUrl.match(/\/([a-zA-Z0-9_\-]+)(\?|$)/);
+  if (dbMatch && dbMatch[1]) {
+    dbName = dbMatch[1];
+  }
 }
+
+const effectiveDbUrl = `${defaultClusterBase}/${dbName}?${defaultParams}`;
+console.log(`[Database] Connecting to isolated database: "${dbName}"`);
 
 process.env.DATABASE_URL = effectiveDbUrl;
 process.env.MONGO_URI = effectiveDbUrl;
