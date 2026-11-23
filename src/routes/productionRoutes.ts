@@ -1,0 +1,2883 @@
+import { Router } from 'express';
+import { prisma } from '../index';
+import { authenticate } from '../middlewares/authMiddleware';
+import { fastCache } from '../utils/fastCache';
+import { sanitizePhotos, uploadBase64ToCloudinary } from '../utils/cloudinaryHelper';
+import { parsePieceAreaSqFt } from '../utils/projectSync';
+
+const router = Router();
+
+// Get production logs
+router.get('/', authenticate, async (req, res) => {
+  try {
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const rawLogs = await db.collection('ProductionLog').find({}).sort({ createdAt: -1 }).limit(1000).toArray();
+        const projectIds = Array.from(new Set(rawLogs.map((l: any) => l.projectId).filter(Boolean)));
+        const machineIds = Array.from(new Set(rawLogs.map((l: any) => l.machineId).filter(Boolean)));
+
+        const projectObjIds = projectIds.filter((id: any) => mongoose.Types.ObjectId.isValid(id)).map((id: any) => new mongoose.Types.ObjectId(id));
+        const machineObjIds = machineIds.filter((id: any) => mongoose.Types.ObjectId.isValid(id)).map((id: any) => new mongoose.Types.ObjectId(id));
+
+        const [rawProjects, rawMachines] = await Promise.all([
+          db.collection('Project').find({ $or: [{ _id: { $in: projectObjIds } }, { id: { $in: projectIds } }] }, { projection: { name: 1, projectId: 1, clientName: 1 } }).toArray(),
+          db.collection('Machine').find({ $or: [{ _id: { $in: machineObjIds } }, { id: { $in: machineIds } }] }, { projection: { name: 1 } }).toArray()
+        ]);
+
+        const projectMap = new Map();
+        rawProjects.forEach((p: any) => projectMap.set(p._id.toString(), { name: p.name, projectId: p.projectId, clientName: p.clientName }));
+
+        const machineMap = new Map();
+        rawMachines.forEach((m: any) => machineMap.set(m._id.toString(), { name: m.name }));
+
+        const enrichedLogs = rawLogs.map((l: any) => ({
+          ...l,
+          id: l._id.toString(),
+          projectId: l.projectId ? l.projectId.toString() : null,
+          machineId: l.machineId ? l.machineId.toString() : null,
+          project: l.projectId ? projectMap.get(l.projectId.toString()) : null,
+          machine: l.machineId ? machineMap.get(l.machineId.toString()) : null
+        }));
+
+        return res.json(enrichedLogs);
+      } catch (mErr) {
+        console.warn('Mongoose production logs query failed, falling back to Prisma:', mErr);
+      }
+    }
+
+    const logs = await prisma.productionLog.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: { project: { select: { name: true } }, machine: { select: { name: true } } }
+    });
+    res.json(logs);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching production logs' });
+  }
+});
+
+// Get Active Work Orders (Comprehensive List)
+router.get('/work-orders', authenticate, async (req, res) => {
+  try {
+    const cached = fastCache.get('prod_work_orders');
+    if (cached) return res.json(cached);
+
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const rawProjects = await db.collection('Project').find({ status: 'work_order' }).toArray();
+        const pIds = rawProjects.map((p: any) => p._id.toString());
+        const pObjIds = pIds.map((id: string) => new mongoose.Types.ObjectId(id));
+
+        const [rawMachineLogs, rawProdLogs, rawMachines] = await Promise.all([
+          db.collection('MachineLog').find({ $or: [{ projectId: { $in: pIds } }, { projectId: { $in: pObjIds } }] }).toArray(),
+          db.collection('ProductionLog').find({ $or: [{ projectId: { $in: pIds } }, { projectId: { $in: pObjIds } }] }).toArray(),
+          db.collection('Machine').find({}, { projection: { name: 1 } }).toArray()
+        ]);
+
+        const machineMap = new Map();
+        rawMachines.forEach((m: any) => machineMap.set(m._id.toString(), m.name));
+
+        const mLogsByProject = new Map();
+        rawMachineLogs.forEach((ml: any) => {
+          const pId = ml.projectId?.toString();
+          if (!mLogsByProject.has(pId)) mLogsByProject.set(pId, []);
+          mLogsByProject.get(pId).push({
+            ...ml,
+            machine: ml.machineId ? { name: machineMap.get(ml.machineId.toString()) || 'Machine' } : null
+          });
+        });
+
+        const pLogsByProject = new Map();
+        rawProdLogs.forEach((pl: any) => {
+          const pId = pl.projectId?.toString();
+          if (!pLogsByProject.has(pId)) pLogsByProject.set(pId, []);
+          pLogsByProject.get(pId).push(pl);
+        });
+
+        const formattedWorkOrders = rawProjects.map((p: any) => {
+          const pId = p._id.toString();
+          const pMachineLogs = mLogsByProject.get(pId) || [];
+          const pProdLogs = pLogsByProject.get(pId) || [];
+
+          let totalUsageTimeHours = 0;
+          let earliestStart = null as Date | null;
+          let latestEnd = null as Date | null;
+          const machinesUsed = new Set<string>();
+
+          pMachineLogs.forEach((log: any) => {
+            if (log.machine?.name) machinesUsed.add(log.machine.name);
+            const start = new Date(log.startTime);
+            const end = log.endTime ? new Date(log.endTime) : new Date();
+            if (!earliestStart || start < earliestStart) earliestStart = start;
+            if (!latestEnd || end > latestEnd) latestEnd = end;
+            const diffMs = end.getTime() - start.getTime();
+            totalUsageTimeHours += (diffMs / (1000 * 60 * 60));
+          });
+
+          const completedLogs = pProdLogs.filter((pl: any) => pl.status === 'completed');
+          const totalLogs = pProdLogs.length;
+          const statusText = totalLogs > 0 ? `${completedLogs.length}/${totalLogs} Stages Completed` : 'In Progress';
+
+          return {
+            id: pId,
+            projectId: p.projectId,
+            clientDemand: p.requirements || p.description || 'N/A',
+            machinesUsed: Array.from(machinesUsed).join(', ') || 'N/A',
+            startTime: earliestStart,
+            endTime: latestEnd,
+            dateRange: earliestStart && latestEnd ? `${earliestStart.toLocaleDateString()} - ${latestEnd.toLocaleDateString()}` : 'N/A',
+            totalUsageTime: totalUsageTimeHours.toFixed(2) + ' hours',
+            status: statusText,
+            progressPercentage: p.progressPercentage || 0
+          };
+        });
+
+        fastCache.set('prod_work_orders', formattedWorkOrders, 30);
+        return res.json(formattedWorkOrders);
+      } catch (mErr) {
+        console.warn('Mongoose active work orders query failed, falling back to Prisma:', mErr);
+      }
+    }
+
+    const projects = await prisma.project.findMany({
+      where: { status: 'work_order' },
+      select: {
+        id: true,
+        projectId: true,
+        requirements: true,
+        description: true,
+        progressPercentage: true,
+        machineLogs: {
+          select: {
+            startTime: true,
+            endTime: true,
+            machine: { select: { name: true } }
+          }
+        },
+        productionLogs: {
+          select: {
+            id: true,
+            status: true
+          }
+        }
+      }
+    });
+
+    const formattedWorkOrders = projects.map(p => {
+      let totalUsageTimeHours = 0;
+      let earliestStart = null as Date | null;
+      let latestEnd = null as Date | null;
+      const machinesUsed = new Set<string>();
+
+      p.machineLogs.forEach(log => {
+        if (log.machine) machinesUsed.add(log.machine.name);
+        
+        const start = new Date(log.startTime);
+        const end = log.endTime ? new Date(log.endTime) : new Date();
+        
+        if (!earliestStart || start < earliestStart) earliestStart = start;
+        if (!latestEnd || end > latestEnd) latestEnd = end;
+
+        const diffMs = end.getTime() - start.getTime();
+        totalUsageTimeHours += (diffMs / (1000 * 60 * 60));
+      });
+
+      const completedLogs = p.productionLogs.filter(pl => pl.status === 'completed');
+      const totalLogs = p.productionLogs.length;
+      const statusText = totalLogs > 0 ? `${completedLogs.length}/${totalLogs} Stages Completed` : 'In Progress';
+
+      return {
+        id: p.id,
+        projectId: p.projectId,
+        clientDemand: p.requirements || p.description || 'N/A',
+        machinesUsed: Array.from(machinesUsed).join(', ') || 'N/A',
+        startTime: earliestStart,
+        endTime: latestEnd,
+        dateRange: earliestStart && latestEnd ? `${earliestStart.toLocaleDateString()} - ${latestEnd.toLocaleDateString()}` : 'N/A',
+        totalUsageTime: totalUsageTimeHours.toFixed(2) + ' hours',
+        status: statusText,
+        progressPercentage: p.progressPercentage
+      };
+    });
+
+    fastCache.set('prod_work_orders', formattedWorkOrders, 30);
+    res.json(formattedWorkOrders);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error fetching active work orders' });
+  }
+});
+
+// Get production logs by project
+router.get('/project/:projectId', authenticate, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    // Auto-reconcile orphaned ProductionLogs when slabs/pieces have been deleted
+    const activeSlabs = await prisma.slab.findMany({
+      where: { projectId: String(projectId) },
+      select: { id: true, name: true, createdAt: true, pieces: { select: { id: true, productName: true } } }
+    });
+    if (activeSlabs.length === 0) {
+      await Promise.all([
+        prisma.productionLog.deleteMany({ where: { projectId: String(projectId) } }).catch(() => {}),
+        prisma.machineLog.deleteMany({ where: { projectId: String(projectId) } }).catch(() => {}),
+        prisma.crate.deleteMany({ where: { projectId: String(projectId) } }).catch(() => {}),
+        prisma.dispatch.deleteMany({ where: { projectId: String(projectId) } }).catch(() => {})
+      ]);
+      return res.json([]);
+    }
+    const validIds = new Set<string>();
+    const validNames = new Set<string>();
+    let oldestSlabTime = Infinity;
+    activeSlabs.forEach((s: any) => {
+      validIds.add(String(s.id));
+      if (s.name) validNames.add(String(s.name).trim().toLowerCase());
+      if (s.createdAt) {
+        const t = new Date(s.createdAt).getTime();
+        if (!isNaN(t) && t < oldestSlabTime) oldestSlabTime = t;
+      }
+      if (Array.isArray(s.pieces)) {
+        s.pieces.forEach((p: any) => {
+          validIds.add(String(p.id));
+          if (p.productName) validNames.add(String(p.productName).trim().toLowerCase());
+        });
+      }
+    });
+
+    if (db) {
+      try {
+        const query = { $or: [{ projectId: String(projectId) }, { projectId: mongoose.Types.ObjectId.isValid(projectId) ? new mongoose.Types.ObjectId(projectId) : projectId }] };
+        const rawLogs = await db.collection('ProductionLog').find(query).sort({ createdAt: 1 }).toArray();
+        const orphanLogIds: any[] = [];
+        const validRawLogs = rawLogs.filter((l: any) => {
+          const logPieceIds = Array.isArray(l.pieceIds) ? l.pieceIds.map(String) : [];
+          if (logPieceIds.length > 0) {
+            if (!logPieceIds.some((pid: string) => validIds.has(pid))) {
+              orphanLogIds.push(l._id);
+              return false;
+            }
+            return true;
+          }
+          if (l.slabId && String(l.slabId) !== 'all' && !validIds.has(String(l.slabId))) {
+            orphanLogIds.push(l._id);
+            return false;
+          }
+          if (l.productId && String(l.productId) !== 'all' && !validIds.has(String(l.productId))) {
+            orphanLogIds.push(l._id);
+            return false;
+          }
+          const logProdName = (l.productName || '').trim().toLowerCase();
+          if (logProdName && logProdName !== 'all' && logProdName !== 'all slabs' && !validNames.has(logProdName)) {
+            orphanLogIds.push(l._id);
+            return false;
+          }
+          if (oldestSlabTime !== Infinity && l.createdAt) {
+            const logTime = new Date(l.createdAt).getTime();
+            if (!isNaN(logTime) && logTime < oldestSlabTime - 5000) {
+              orphanLogIds.push(l._id);
+              return false;
+            }
+          }
+          return true;
+        });
+        if (orphanLogIds.length > 0) {
+          db.collection('ProductionLog').deleteMany({ _id: { $in: orphanLogIds } }).catch(() => {});
+        }
+        const machineIds = validRawLogs.map((l: any) => l.machineId).filter(Boolean);
+        const workerIds = validRawLogs.map((l: any) => l.workerId).filter(Boolean);
+
+        const machineObjIds = machineIds.filter((mId: string) => mongoose.Types.ObjectId.isValid(mId)).map((mId: string) => new mongoose.Types.ObjectId(mId));
+        const workerObjIds = workerIds.filter((wId: string) => mongoose.Types.ObjectId.isValid(wId)).map((wId: string) => new mongoose.Types.ObjectId(wId));
+
+        const [rawMachines, rawWorkers] = await Promise.all([
+          db.collection('Machine').find({ $or: [{ _id: { $in: machineObjIds } }, { id: { $in: machineIds } }] }, { projection: { name: 1 } }).toArray(),
+          db.collection('Staff').find({ $or: [{ _id: { $in: workerObjIds } }, { id: { $in: workerIds } }] }, { projection: { name: 1 } }).toArray()
+        ]);
+
+        const machineMap = new Map();
+        rawMachines.forEach((m: any) => machineMap.set(m._id.toString(), { name: m.name }));
+
+        const workerMap = new Map();
+        rawWorkers.forEach((w: any) => workerMap.set(w._id.toString(), { name: w.name }));
+
+        const enriched = validRawLogs.map((l: any) => ({
+          ...l,
+          id: l._id.toString(),
+          machine: l.machineId ? machineMap.get(l.machineId.toString()) || null : null,
+          worker: l.workerId ? workerMap.get(l.workerId.toString()) || null : null
+        }));
+
+        return res.json(enriched);
+      } catch (mErr) {
+        console.warn('Mongoose production logs fetch failed:', mErr);
+      }
+    }
+
+    const logs = await prisma.productionLog.findMany({
+      where: { projectId: String(projectId) },
+      orderBy: { createdAt: 'asc' },
+      include: { machine: { select: { name: true } }, worker: { select: { name: true } } }
+    });
+    res.json(logs);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching production logs for project' });
+  }
+});
+
+// Add production log
+router.post('/', authenticate, async (req, res) => {
+  try {
+    const { projectId, stage, machineId, workerId, remarks, quantityProduced, transactionType, productId, productName } = req.body;
+    
+    const newLog = await prisma.productionLog.create({
+      data: {
+        projectId,
+        stage,
+        machineId: machineId || null,
+        workerId: workerId || null,
+        remarks,
+        quantityProduced: Number(quantityProduced) || 0,
+        transactionType,
+        productId,
+        productName,
+        status: 'in_progress',
+        startTime: new Date()
+      }
+    });
+    
+    res.status(201).json(newLog);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error creating production log' });
+  }
+});
+
+// Update production log status (completed)
+router.patch('/:id/complete', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quantityProduced, remarks } = req.body;
+    
+    const updatedLog = await prisma.productionLog.update({
+      where: { id: String(id) },
+      data: {
+        status: 'completed',
+        endTime: new Date(),
+        quantityProduced: quantityProduced ? parseFloat(quantityProduced) : undefined,
+        remarks: remarks || undefined
+      }
+    });
+    
+    // Automatically update project progress
+    const project = await prisma.project.findUnique({
+      where: { id: updatedLog.projectId! },
+      include: { productionLogs: true }
+    });
+    
+    if (project) {
+      const completedStages = project.productionLogs.filter((l: any) => l.status === 'completed').length;
+      const totalStages = project.productionLogs.length || 1;
+      const progressPercentage = Math.round((completedStages / totalStages) * 100);
+      
+      let projectStatus = project.status;
+      if (progressPercentage === 100) projectStatus = 'completed';
+      
+      await prisma.project.update({
+        where: { id: project.id },
+        data: { progressPercentage, status: projectStatus }
+      });
+    }
+
+    res.json(updatedLog);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error updating production log' });
+  }
+});
+
+// --- MATERIAL TRACKING ENDPOINTS ---
+
+// Helper to keep parent OUT log returnedQty and isReturned synchronized with approved child IN logs
+export async function syncParentOutLog(parentLogId: string) {
+  if (!parentLogId) return;
+  try {
+    const parentLog = await prisma.productionLog.findUnique({ where: { id: String(parentLogId) } });
+    if (!parentLog) return;
+
+    const mongoose = require('mongoose');
+    const db = mongoose.connection?.db;
+    let approvedInSum = 0;
+
+    if (db) {
+      const { ObjectId } = mongoose.Types;
+      const objId = ObjectId.isValid(parentLogId) ? new ObjectId(parentLogId) : null;
+      const childInLogs = await db.collection('ProductionLog').find({
+        parentLogId: { $in: [objId, String(parentLogId)].filter(Boolean) },
+        transactionType: 'IN',
+        approvalStatus: 'approved'
+      }).toArray();
+      approvedInSum = childInLogs.reduce((sum: number, l: any) => sum + (Number(l.quantityProduced) || 0), 0);
+    } else {
+      const childInLogs = await prisma.productionLog.findMany({
+        where: {
+          parentLogId: String(parentLogId),
+          transactionType: 'IN',
+          approvalStatus: 'approved'
+        }
+      });
+      approvedInSum = childInLogs.reduce((sum: number, l: any) => sum + (Number(l.quantityProduced) || 0), 0);
+    }
+
+    const outQty = Number(parentLog.quantityProduced) || 0;
+    const isReturned = approvedInSum >= outQty && outQty > 0;
+
+    await prisma.productionLog.update({
+      where: { id: String(parentLogId) },
+      data: {
+        returnedQty: approvedInSum,
+        isReturned: isReturned
+      }
+    });
+
+    fastCache.invalidate('prod_active_out_logs');
+    fastCache.invalidate('prod_pending_approvals');
+    fastCache.invalidate('prod_approved_logs');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+  } catch (err) {
+    console.warn(`syncParentOutLog error for ${parentLogId}:`, err);
+  }
+}
+
+// Fetch all active/unreturned OUT logs (transactionType: 'OUT', approvalStatus: 'approved', isReturned: false/null)
+router.get('/active-out-logs', authenticate, async (req, res) => {
+  try {
+    const cached = fastCache.get('prod_active_out_logs');
+    if (cached) return res.json(cached);
+
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const [rawOutLogs, rawInLogs] = await Promise.all([
+          db.collection('ProductionLog').find({
+            transactionType: 'OUT',
+            approvalStatus: 'approved',
+            $or: [
+              { isReturned: false },
+              { isReturned: null },
+              { isReturned: { $exists: false } }
+            ]
+          }).sort({ createdAt: -1 }).toArray(),
+          db.collection('ProductionLog').find({
+            transactionType: 'IN',
+            approvalStatus: { $in: ['pending', 'redo_in_progress'] },
+            parentLogId: { $ne: null }
+          }, { projection: { parentLogId: 1, quantityProduced: 1 } }).toArray()
+        ]);
+
+        const workerIds = rawOutLogs.map((l: any) => l.workerId).filter(Boolean);
+        const projectIds = rawOutLogs.map((l: any) => l.projectId).filter(Boolean);
+
+        const [rawWorkers, rawProjects] = await Promise.all([
+          db.collection('User').find({ _id: { $in: workerIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }, { projection: { name: 1, staffId: 1 } }).toArray(),
+          db.collection('Project').find({ _id: { $in: projectIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }, { projection: { name: 1, projectId: 1, clientName: 1 } }).toArray()
+        ]);
+
+        const workerMap = new Map();
+        rawWorkers.forEach((w: any) => workerMap.set(w._id.toString(), { name: w.name, staffId: w.staffId }));
+
+        const projectMap = new Map();
+        rawProjects.forEach((p: any) => projectMap.set(p._id.toString(), { name: p.name, projectId: p.projectId, clientName: p.clientName }));
+
+        const allApprovedOutLogs = rawOutLogs.map((log: any) => ({
+          ...log,
+          id: log._id.toString(),
+          worker: log.workerId ? workerMap.get(log.workerId.toString()) : null,
+          project: log.projectId ? projectMap.get(log.projectId.toString()) : null
+        }));
+
+        const activeOutLogs = allApprovedOutLogs.filter((log: any) => {
+          const pendingReturns = rawInLogs
+            .filter((inLog: any) => String(inLog.parentLogId) === String(log.id))
+            .reduce((sum: number, inLog: any) => sum + (inLog.quantityProduced || 0), 0);
+            
+          const availableQty = (log.quantityProduced || 0) - (log.returnedQty || 0) - pendingReturns;
+          log.pendingQty = Math.max(0, availableQty);
+          return availableQty > 0;
+        });
+
+        fastCache.set('prod_active_out_logs', activeOutLogs, 15);
+        return res.json(activeOutLogs);
+      } catch (mErr) {
+        console.warn('Mongoose active OUT logs error, falling back:', mErr);
+      }
+    }
+
+    const [allApprovedOutLogs, pendingInLogs] = await Promise.race([
+      Promise.all([
+        prisma.productionLog.findMany({
+          where: {
+            transactionType: 'OUT',
+            approvalStatus: 'approved',
+            OR: [
+              { isReturned: false },
+              { isReturned: null }
+            ]
+          },
+          orderBy: { createdAt: 'desc' },
+          include: {
+            worker: { select: { name: true, staffId: true } },
+            project: { select: { name: true, projectId: true, clientName: true } }
+          }
+        }),
+        prisma.productionLog.findMany({
+          where: {
+            transactionType: 'IN',
+            approvalStatus: { in: ['pending', 'redo_in_progress'] },
+            parentLogId: { not: null }
+          },
+          select: {
+            parentLogId: true,
+            quantityProduced: true
+          }
+        })
+      ]),
+      new Promise<any[]>((_, reject) => setTimeout(() => reject(new Error('Prisma timeout')), 3000))
+    ]).catch(() => [[], []]);
+
+    // Subtract pending quantities
+    const activeOutLogs = (allApprovedOutLogs || []).filter((log: any) => {
+      const pendingReturns = (pendingInLogs || [])
+        .filter((inLog: any) => String(inLog.parentLogId) === String(log.id))
+        .reduce((sum: number, inLog: any) => sum + (inLog.quantityProduced || 0), 0);
+        
+      const availableQty = (log.quantityProduced || 0) - (log.returnedQty || 0) - pendingReturns;
+      (log as any).pendingQty = Math.max(0, availableQty);
+      return availableQty > 0;
+    });
+
+    fastCache.set('prod_active_out_logs', activeOutLogs, 15);
+    res.json(activeOutLogs);
+  } catch (error) {
+    console.error("Error fetching active OUT logs:", error);
+    res.status(500).json({ message: 'Server error fetching active OUT logs' });
+  }
+});
+
+// Fetch rejected logs for Manager Dashboard
+router.get('/rejected-logs', authenticate, async (req, res) => {
+  try {
+    const cached = fastCache.get('prod_rejected_logs');
+    if (cached) return res.json(cached);
+
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const rawRejected = await db.collection('ProductionLog').find({
+          approvalStatus: { $in: ['rejected_admin', 'redo_in_progress'] }
+        }).sort({ createdAt: -1 }).toArray();
+
+        const workerIds = rawRejected.map((l: any) => l.workerId).filter(Boolean);
+        const projectIds = rawRejected.map((l: any) => l.projectId).filter(Boolean);
+
+        const [rawWorkers, rawProjects] = await Promise.all([
+          db.collection('User').find({ _id: { $in: workerIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }, { projection: { name: 1, staffId: 1 } }).toArray(),
+          db.collection('Project').find({ _id: { $in: projectIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }, { projection: { name: 1, projectId: 1, clientName: 1 } }).toArray()
+        ]);
+
+        const workerMap = new Map();
+        rawWorkers.forEach((w: any) => workerMap.set(w._id.toString(), { name: w.name, staffId: w.staffId }));
+
+        const projectMap = new Map();
+        rawProjects.forEach((p: any) => projectMap.set(p._id.toString(), { name: p.name, projectId: p.projectId, clientName: p.clientName }));
+
+        const rejectedLogs = rawRejected.map((l: any) => ({
+          ...l,
+          id: l._id.toString(),
+          worker: l.workerId ? workerMap.get(l.workerId.toString()) : null,
+          project: l.projectId ? projectMap.get(l.projectId.toString()) : null
+        }));
+
+        fastCache.set('prod_rejected_logs', rejectedLogs, 15);
+        return res.json(rejectedLogs);
+      } catch (mErr) {
+        console.warn('Mongoose rejected logs error:', mErr);
+      }
+    }
+
+    const rejectedLogs = await Promise.race([
+      prisma.productionLog.findMany({
+        where: { approvalStatus: { in: ['rejected_admin', 'redo_in_progress'] } },
+        orderBy: { createdAt: 'desc' },
+        include: {
+          worker: { select: { name: true, staffId: true } },
+          project: { select: { name: true, projectId: true, clientName: true } }
+        }
+      }),
+      new Promise<any[]>((_, reject) => setTimeout(() => reject(new Error('Prisma timeout')), 3000))
+    ]).catch(() => []);
+
+    fastCache.set('prod_rejected_logs', rejectedLogs, 15);
+    res.json(rejectedLogs);
+  } catch (error) {
+    console.error("Error fetching rejected logs:", error);
+    res.status(500).json({ message: 'Server error fetching rejected logs' });
+  }
+});
+
+// Submit new Material IN/OUT log
+const toValidObjectId = (val: any): string | undefined => {
+  if (!val || typeof val !== 'string') return undefined;
+  const trimmed = val.trim();
+  return /^[0-9a-fA-F]{24}$/.test(trimmed) ? trimmed : undefined;
+};
+
+router.post('/material-log', authenticate, async (req: any, res: any) => {
+  try {
+    let { stage, quantityProduced, transactionType, startPhotos, workerId, vendorName, vendorId, vendors, parentLogId, vehicleNumber, challanNumber, productId, productName, slabId, pieceIds, requiresMachine, remarks } = req.body;
+    
+    // If manager submits an OUT log but says no machine required, 
+    // it skips the worker and acts as a direct piece completion (IN log)
+    if (transactionType === 'OUT' && requiresMachine === false) {
+      transactionType = 'IN';
+    }
+
+    let photoUrls = req.body.photoUrls || [];
+    if (!Array.isArray(photoUrls)) {
+      photoUrls = photoUrls ? [photoUrls] : [];
+    }
+    if (photoUrls.length > 0) {
+      if (!startPhotos || typeof startPhotos !== 'object') {
+        startPhotos = { unit: photoUrls[0], machine: photoUrls[0], photos: photoUrls };
+      } else {
+        startPhotos.photos = photoUrls;
+        if (!startPhotos.unit && photoUrls[0]) startPhotos.unit = photoUrls[0];
+        if (!startPhotos.machine && photoUrls[0]) startPhotos.machine = photoUrls[0];
+      }
+    }
+
+    startPhotos = await sanitizePhotos(startPhotos);
+
+    let directPhotoUrl = req.body.photoUrl || (Array.isArray(startPhotos?.photos) ? startPhotos.photos[0] : undefined);
+    if (directPhotoUrl && typeof directPhotoUrl === 'string' && directPhotoUrl.startsWith('data:image/')) {
+      directPhotoUrl = await uploadBase64ToCloudinary(directPhotoUrl);
+    }
+    const resolvedPhoto = directPhotoUrl || (typeof startPhotos === 'object' ? (startPhotos.machine || startPhotos.unit || startPhotos.software || startPhotos.photos?.[0]) : startPhotos) || undefined;
+
+    const computeEffectiveCreatedAt = (dateInput?: any) => {
+      const now = new Date();
+      if (!dateInput) return now;
+      const chosen = new Date(dateInput);
+      if (isNaN(chosen.getTime())) return now;
+      const isToday = chosen.getFullYear() === now.getFullYear() &&
+                      chosen.getMonth() === now.getMonth() &&
+                      chosen.getDate() === now.getDate();
+      if (isToday) {
+        return now;
+      }
+      chosen.setHours(now.getHours(), now.getMinutes(), now.getSeconds(), now.getMilliseconds());
+      return chosen;
+    };
+
+    let projectId: string | undefined = undefined;
+    if (parentLogId && toValidObjectId(parentLogId)) {
+      const parentLog = await prisma.productionLog.findUnique({
+        where: { id: String(parentLogId).trim() }
+      });
+      if (parentLog) {
+        projectId = toValidObjectId(parentLog.projectId);
+        productName = parentLog.productName || productName;
+        productId = parentLog.productId || productId;
+        slabId = parentLog.slabId || slabId;
+        vendorId = parentLog.vendorId || vendorId;
+        vendorName = parentLog.vendorName || vendorName;
+        stage = parentLog.stage || stage;
+      }
+    } else {
+      projectId = toValidObjectId(req.body.projectId);
+    }
+
+    // Check if user is authorized to auto-approve (Admins and Managers)
+    const isSuperOrManager = req.user?.role === 'admin' || req.user?.role === 'manager' || req.body.source === 'admin_manual';
+
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    // Handle multiple vendors for OUT/IN transactions
+    if (vendors && Array.isArray(vendors) && vendors.length > 0) {
+      const newLogs = await Promise.all(vendors.map(async (v: any) => {
+        const itemParentLogId = toValidObjectId(v.parentLogId || parentLogId);
+        let itemProjectId = toValidObjectId(v.projectId || projectId);
+        let itemProductName = (v.productName || productName)?.trim() || undefined;
+        let itemProductId = (v.productId || productId)?.trim() || undefined;
+        let itemSlabId = toValidObjectId(v.slabId || slabId);
+        let itemVendorId = toValidObjectId(v.vendorId);
+        let itemVendorName = v.vendorName?.trim() || undefined;
+        let itemStage = (v.stage || stage || 'Production').trim();
+
+        if (itemParentLogId) {
+          try {
+            const pLog = await prisma.productionLog.findUnique({ where: { id: itemParentLogId } });
+            if (pLog) {
+              if (!itemProjectId) itemProjectId = toValidObjectId(pLog.projectId);
+              if (!itemProductName) itemProductName = pLog.productName || undefined;
+              if (!itemProductId) itemProductId = pLog.productId || undefined;
+              if (!itemSlabId) itemSlabId = toValidObjectId(pLog.slabId);
+              if (!itemVendorId) itemVendorId = toValidObjectId(pLog.vendorId);
+              if (!itemVendorName) itemVendorName = pLog.vendorName || undefined;
+              if (!v.stage) itemStage = pLog.stage || itemStage;
+            }
+          } catch (e) {
+            console.warn("Parent log lookup error:", e);
+          }
+        }
+
+        const effectiveApproval = (isSuperOrManager || itemStage === 'Dispatch' || req.body.autoApprove) ? 'approved' : 'pending';
+
+        let created: any = null;
+        try {
+          created = await prisma.productionLog.create({
+            data: {
+              projectId: itemProjectId,
+              stage: itemStage,
+              quantityProduced: v.qty ? parseFloat(v.qty) : (quantityProduced ? parseFloat(quantityProduced) : 0),
+              transactionType,
+              startPhotos,
+              workerId: toValidObjectId(workerId),
+              vendorName: itemVendorName,
+              vendorId: itemVendorId,
+              vehicleNumber: vehicleNumber?.trim() || undefined,
+              challanNumber: challanNumber?.trim() || undefined,
+              boxCode: req.body.boxCode?.trim() || undefined,
+              parentLogId: itemParentLogId,
+              productId: itemProductId,
+              productName: itemProductName,
+              slabId: itemSlabId,
+              pieceIds: Array.isArray(v.pieceIds) ? v.pieceIds : (Array.isArray(pieceIds) ? pieceIds : []),
+              approvalStatus: effectiveApproval,
+              status: 'completed',
+              isReturned: false,
+              returnedQty: 0,
+              remarks: v.remarks?.trim() || remarks?.trim() || undefined,
+              createdAt: computeEffectiveCreatedAt(req.body.date),
+              photoUrl: resolvedPhoto || undefined
+            }
+          });
+        } catch (pErr: any) {
+          console.warn("Prisma create failed, falling back to direct MongoDB:", pErr.message);
+          if (db) {
+            const doc: any = {
+              stage: itemStage,
+              quantityProduced: v.qty ? parseFloat(v.qty) : (quantityProduced ? parseFloat(quantityProduced) : 0),
+              transactionType,
+              startPhotos,
+              approvalStatus: effectiveApproval,
+              status: 'completed',
+              isReturned: false,
+              returnedQty: 0,
+              remarks: v.remarks?.trim() || remarks?.trim() || undefined,
+              createdAt: computeEffectiveCreatedAt(req.body.date),
+              photoUrl: resolvedPhoto || undefined,
+              pieceIds: Array.isArray(v.pieceIds) ? v.pieceIds : (Array.isArray(pieceIds) ? pieceIds : [])
+            };
+            if (itemProjectId) doc.projectId = new mongoose.Types.ObjectId(itemProjectId);
+            if (workerId && toValidObjectId(workerId)) doc.workerId = new mongoose.Types.ObjectId(toValidObjectId(workerId));
+            if (itemVendorId) doc.vendorId = new mongoose.Types.ObjectId(itemVendorId);
+            if (itemVendorName) doc.vendorName = itemVendorName;
+            if (vehicleNumber) doc.vehicleNumber = vehicleNumber.trim();
+            if (challanNumber) doc.challanNumber = challanNumber.trim();
+            if (itemParentLogId) doc.parentLogId = new mongoose.Types.ObjectId(itemParentLogId);
+            if (itemProductId) doc.productId = itemProductId;
+            if (itemProductName) doc.productName = itemProductName;
+            if (itemSlabId) doc.slabId = new mongoose.Types.ObjectId(itemSlabId);
+            doc.updatedAt = new Date();
+
+            const insRes = await db.collection('ProductionLog').insertOne(doc);
+            created = { ...doc, id: insRes.insertedId.toString() };
+          } else {
+            throw pErr;
+          }
+        }
+
+        if (transactionType === 'IN' && itemParentLogId) {
+          if (created.approvalStatus === 'approved') {
+            await syncParentOutLog(itemParentLogId);
+          }
+        }
+
+        return created;
+      }));
+
+      fastCache.invalidate('prod_');
+      fastCache.invalidate('all_projects');
+      fastCache.invalidate('slabs_project_');
+      fastCache.invalidate('project_hierarchy_v2');
+      fastCache.invalidate('vendors_stats');
+      fastCache.invalidate('vendor_ledger_');
+
+      return res.status(201).json(newLogs);
+    }
+
+    // Single vendor or regular OUT/IN transaction
+    const finalStage = (stage || 'Production').trim();
+    const effectiveApproval = (isSuperOrManager || finalStage === 'Dispatch' || req.body.autoApprove) ? 'approved' : 'pending';
+
+    let newLog: any = null;
+    try {
+      newLog = await prisma.productionLog.create({
+        data: {
+          projectId: toValidObjectId(projectId),
+          stage: finalStage,
+          quantityProduced: quantityProduced ? parseFloat(quantityProduced) : 0,
+          transactionType,
+          startPhotos,
+          workerId: toValidObjectId(workerId),
+          vendorName: vendorName?.trim() || undefined,
+          vendorId: toValidObjectId(vendorId),
+          vehicleNumber: vehicleNumber?.trim() || undefined,
+          challanNumber: challanNumber?.trim() || undefined,
+          boxCode: req.body.boxCode?.trim() || undefined,
+          parentLogId: toValidObjectId(parentLogId),
+          productId: productId?.trim() || undefined,
+          productName: productName?.trim() || undefined,
+          slabId: toValidObjectId(slabId),
+          pieceIds: Array.isArray(pieceIds) ? pieceIds : [],
+          approvalStatus: effectiveApproval,
+          status: 'completed',
+          isReturned: false,
+          returnedQty: 0,
+          remarks: remarks?.trim() || undefined,
+          createdAt: computeEffectiveCreatedAt(req.body.date),
+          photoUrl: resolvedPhoto || undefined
+        }
+      });
+    } catch (pErr: any) {
+      console.warn("Prisma single log create failed, falling back to direct MongoDB:", pErr.message);
+      if (db) {
+        const doc: any = {
+          stage: finalStage,
+          quantityProduced: quantityProduced ? parseFloat(quantityProduced) : 0,
+          transactionType,
+          startPhotos,
+          approvalStatus: effectiveApproval,
+          status: 'completed',
+          isReturned: false,
+          returnedQty: 0,
+          remarks: remarks?.trim() || undefined,
+          createdAt: computeEffectiveCreatedAt(req.body.date),
+          photoUrl: resolvedPhoto || undefined,
+          pieceIds: Array.isArray(pieceIds) ? pieceIds : []
+        };
+        const validProjId = toValidObjectId(projectId);
+        if (validProjId) doc.projectId = new mongoose.Types.ObjectId(validProjId);
+        const validWorkerId = toValidObjectId(workerId);
+        if (validWorkerId) doc.workerId = new mongoose.Types.ObjectId(validWorkerId);
+        const validVendorId = toValidObjectId(vendorId);
+        if (validVendorId) doc.vendorId = new mongoose.Types.ObjectId(validVendorId);
+        if (vendorName) doc.vendorName = vendorName.trim();
+        if (vehicleNumber) doc.vehicleNumber = vehicleNumber.trim();
+        if (challanNumber) doc.challanNumber = challanNumber.trim();
+        const validParentId = toValidObjectId(parentLogId);
+        if (validParentId) doc.parentLogId = new mongoose.Types.ObjectId(validParentId);
+        if (productId) doc.productId = productId.trim();
+        if (productName) doc.productName = productName.trim();
+        const validSlabId = toValidObjectId(slabId);
+        if (validSlabId) doc.slabId = new mongoose.Types.ObjectId(validSlabId);
+        doc.updatedAt = new Date();
+
+        const insRes = await db.collection('ProductionLog').insertOne(doc);
+        newLog = { ...doc, id: insRes.insertedId.toString() };
+      } else {
+        throw pErr;
+      }
+    }
+
+    // If log is auto-approved (e.g. direct Dispatch), automatically update pieces
+    if (newLog.approvalStatus === 'approved') {
+      try {
+        let effectivePieceIds = newLog.pieceIds && newLog.pieceIds.length > 0 ? newLog.pieceIds : [];
+        if (effectivePieceIds.length === 0 && newLog.slabId) {
+          const slabPieces = await prisma.piece.findMany({
+            where: { slabId: String(newLog.slabId) },
+            orderBy: { pieceNumber: 'asc' }
+          });
+          if (slabPieces.length > 0) {
+            effectivePieceIds = slabPieces.slice(0, Number(newLog.quantityProduced) || slabPieces.length).map((p: any) => p.id);
+          }
+        }
+
+        if (effectivePieceIds.length > 0) {
+          const cleanStage = (newLog.stage || 'Dispatch').replace(' Work', '').trim();
+          for (const pieceId of effectivePieceIds) {
+            await prisma.piece.update({
+              where: { id: pieceId },
+              data: {
+                status: 'completed',
+                stage: cleanStage
+              }
+            });
+            await prisma.pieceLog.create({
+              data: {
+                pieceId: pieceId,
+                stage: newLog.stage,
+                status: 'completed',
+                operatorId: newLog.workerId,
+                remarks: 'Auto-logged from Direct Dispatch',
+                vehicleNumber: newLog.vehicleNumber || undefined,
+                endTime: new Date()
+              }
+            });
+          }
+        }
+      } catch (pieceErr) {
+        console.warn('Could not auto-update pieces for approved log:', pieceErr);
+      }
+    }
+
+    // Update parent log for IN transactions (Partial returns support)
+    if (newLog.transactionType === 'IN' && newLog.parentLogId) {
+      if (newLog.approvalStatus === 'approved') {
+        await syncParentOutLog(String(newLog.parentLogId));
+      }
+    }
+
+    // Invalidate caches
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_v2');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+
+    res.status(201).json(newLog);
+  } catch (error: any) {
+    console.error("Material Log Error:", error);
+    res.status(500).json({ message: 'Server error creating material log', error: error.message, stack: error.stack });
+  }
+});
+
+// Fetch pending approvals for Admin
+router.get('/pending-approvals', authenticate, async (req, res) => {
+  try {
+    const cached = fastCache.get('prod_pending_approvals');
+    if (cached) return res.json(cached);
+
+    let pendingLogs: any[] = [];
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    
+
+    if (db) {
+      try {
+        const rawLogs = await db.collection('ProductionLog').find({ approvalStatus: 'pending' }).sort({ createdAt: -1 }).toArray();
+        const workerIds = rawLogs.map((l: any) => l.workerId).filter(Boolean);
+        const projectIds = rawLogs.map((l: any) => l.projectId).filter(Boolean);
+        const machineIds = rawLogs.map((l: any) => l.machineId).filter(Boolean);
+
+        const [rawWorkers, rawProjects, rawMachines] = await Promise.all([
+          db.collection('User').find({ _id: { $in: workerIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }).toArray(),
+          db.collection('Project').find({ _id: { $in: projectIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }).toArray(),
+          db.collection('Machine').find({ _id: { $in: machineIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }).toArray()
+        ]);
+
+        const workerMap = new Map();
+        rawWorkers.forEach((w: any) => workerMap.set(w._id.toString(), { name: w.name }));
+
+        const projectMap = new Map();
+        rawProjects.forEach((p: any) => projectMap.set(p._id.toString(), { name: p.name, projectId: p.projectId, clientName: p.clientName }));
+
+        const machineMap = new Map();
+        rawMachines.forEach((m: any) => machineMap.set(m._id.toString(), { name: m.name }));
+
+        pendingLogs = rawLogs.map((l: any) => ({
+          ...l,
+          id: l._id.toString(),
+          worker: l.workerId ? workerMap.get(l.workerId.toString()) : null,
+          project: l.projectId ? projectMap.get(l.projectId.toString()) : null,
+          machine: l.machineId ? machineMap.get(l.machineId.toString()) : null
+        }));
+
+        fastCache.set('prod_pending_approvals', pendingLogs, 120);
+        return res.json(pendingLogs);
+      } catch (err) {
+        console.warn('Mongoose pending approvals query failed, falling back to Prisma:', err);
+      }
+    }
+
+    pendingLogs = await prisma.productionLog.findMany({
+      where: { approvalStatus: 'pending' },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        worker: { select: { name: true } },
+        project: { select: { name: true, projectId: true, clientName: true } },
+        machine: { select: { name: true } }
+      }
+    });
+
+    fastCache.set('prod_pending_approvals', pendingLogs, 120);
+    res.json(pendingLogs);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching pending approvals' });
+  }
+});
+
+// Approve or Reject a material log (Assign Project if approved)
+
+// Approve or Reject a material log (Assign Project if approved)
+router.patch('/:id/approve', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { approvalStatus, projectId, splits, remarks } = req.body; // approvalStatus: 'approved' or 'rejected'
+
+    const originalLog = await prisma.productionLog.findUnique({ where: { id: String(id) } });
+    if (!originalLog) return res.status(404).json({ message: 'Log not found' });
+
+    let updatedLog;
+
+    if (splits && splits.length > 0 && approvalStatus === 'approved') {
+      const totalSplitQty = splits.reduce((acc: number, s: any) => acc + Number(s.qty || 0), 0);
+      const rejectedPieces = req.body.rejectedPieces;
+      const rejectedQty = rejectedPieces && Number(rejectedPieces.qty) > 0 ? Number(rejectedPieces.qty) : 0;
+      const totalHandledQty = totalSplitQty + rejectedQty;
+      const remainingPendingQty = (Number(originalLog.quantityProduced) || 0) - totalHandledQty;
+      
+      const { id: _id, createdAt, updatedAt, ...restLogData } = originalLog;
+
+      // Handle rejected portion if provided
+      if (rejectedQty > 0) {
+        try {
+          const rejectedStartPhotos = {
+            ...(typeof originalLog.startPhotos === 'object' && originalLog.startPhotos !== null ? originalLog.startPhotos : {}),
+            ...(rejectedPieces.rejectionPhoto ? { rejectionPhoto: rejectedPieces.rejectionPhoto } : {})
+          };
+
+          await prisma.productionLog.create({
+            data: {
+              ...restLogData,
+              approvalStatus: 'rejected_admin',
+              quantityProduced: rejectedQty,
+              remarks: rejectedPieces.remarks || remarks || 'Rejected by Admin during approval',
+              pieceIds: rejectedPieces.pieceIds && Array.isArray(rejectedPieces.pieceIds) ? rejectedPieces.pieceIds : [],
+              startPhotos: rejectedStartPhotos,
+              projectId: originalLog.projectId || (splits[0]?.projectId ? String(splits[0].projectId) : undefined),
+              productId: originalLog.productId || (splits[0]?.productId ? String(splits[0].productId) : undefined),
+              productName: rejectedPieces.productName || (originalLog.productName ? `${originalLog.productName.split(' - ')[0]} (${rejectedQty} Pcs)` : undefined),
+              slabId: originalLog.slabId || (splits[0]?.slabId ? String(splits[0].slabId) : undefined),
+            }
+          });
+        } catch (rejErr) {
+          console.warn('Could not create rejected production log during partial approval:', rejErr);
+        }
+      }
+
+      if (remainingPendingQty > 0) {
+        // Partial approval with pending remainder: Keep original log pending with remainder, create new logs for all splits
+        updatedLog = await prisma.productionLog.update({
+          where: { id: String(id) },
+          data: { quantityProduced: remainingPendingQty } // stays pending
+        });
+        
+        for (const split of splits) {
+          const newSplitLog = await prisma.productionLog.create({
+            data: {
+              ...restLogData,
+              approvalStatus: 'approved',
+              projectId: split.projectId ? String(split.projectId) : undefined,
+              productId: split.productId ? String(split.productId) : undefined,
+              productName: split.productName ? String(split.productName) : undefined,
+              slabId: split.slabId ? String(split.slabId) : undefined,
+              pieceIds: split.pieceIds && split.pieceIds.length > 0 ? split.pieceIds : [],
+              quantityProduced: Number(split.qty || 1),
+              remarks: remarks ? String(remarks) : originalLog.remarks
+            }
+          });
+          
+          let effectivePieceIds = split.pieceIds && split.pieceIds.length > 0 ? split.pieceIds : [];
+          if (effectivePieceIds.length === 0 && split.slabId) {
+            try {
+              const slabPieces = await prisma.piece.findMany({
+                where: { slabId: String(split.slabId) },
+                orderBy: { pieceNumber: 'asc' }
+              });
+              if (slabPieces.length > 0) {
+                effectivePieceIds = slabPieces.slice(0, Number(split.qty) || slabPieces.length).map((p: any) => p.id);
+              }
+            } catch (pFindErr) {
+              console.warn('Could not find pieces for slabId:', split.slabId, pFindErr);
+            }
+          }
+
+          if (effectivePieceIds.length > 0) {
+            for (const pieceId of effectivePieceIds) {
+              try {
+                const cleanStage = (split.stage ? split.stage : originalLog.stage).replace(' Work', '').trim();
+                const pieceStatus = 'completed';
+                await prisma.piece.update({
+                  where: { id: pieceId },
+                  data: { 
+                    status: pieceStatus,
+                    stage: cleanStage
+                  }
+                });
+                await prisma.pieceLog.create({
+                  data: {
+                    pieceId: pieceId,
+                    stage: originalLog.stage,
+                    status: pieceStatus,
+                    operatorId: originalLog.workerId,
+                    remarks: 'Auto-logged from Material/Machine Approval',
+                    vehicleNumber: originalLog.vehicleNumber || undefined,
+                    endTime: originalLog.transactionType === 'OUT' ? undefined : new Date()
+                  }
+                });
+              } catch (pieceErr) {
+                console.warn(`Failed to update piece ${pieceId}:`, pieceErr);
+              }
+            }
+          }
+        }
+      } else {
+        // Full approval / all handled (splits + optional rejection)
+        const firstSplit = splits[0];
+        
+        updatedLog = await prisma.productionLog.update({
+          where: { id: String(id) },
+          data: {
+            approvalStatus: 'approved',
+            projectId: firstSplit.projectId ? String(firstSplit.projectId) : undefined,
+            productId: firstSplit.productId ? String(firstSplit.productId) : undefined,
+            productName: firstSplit.productName ? String(firstSplit.productName) : undefined,
+            slabId: firstSplit.slabId ? String(firstSplit.slabId) : undefined,
+            pieceIds: firstSplit.pieceIds && firstSplit.pieceIds.length > 0 ? firstSplit.pieceIds : [],
+            quantityProduced: Number(firstSplit.qty || originalLog.quantityProduced),
+            remarks: remarks ? String(remarks) : undefined
+          }
+        });
+        
+        for (let i = 1; i < splits.length; i++) {
+          const split = splits[i];
+          await prisma.productionLog.create({
+            data: {
+              ...restLogData,
+              approvalStatus: 'approved',
+              projectId: split.projectId ? String(split.projectId) : undefined,
+              productId: split.productId ? String(split.productId) : undefined,
+              productName: split.productName ? String(split.productName) : undefined,
+              slabId: split.slabId ? String(split.slabId) : undefined,
+              pieceIds: split.pieceIds && split.pieceIds.length > 0 ? split.pieceIds : [],
+              quantityProduced: Number(split.qty || 1),
+              remarks: remarks ? String(remarks) : undefined
+            }
+          });
+        }
+        
+        // Update pieces for all splits including the first one
+        for (const split of splits) {
+          let effectivePieceIds = split.pieceIds && split.pieceIds.length > 0 ? split.pieceIds : [];
+          if (effectivePieceIds.length === 0 && split.slabId) {
+            try {
+              const slabPieces = await prisma.piece.findMany({
+                where: { slabId: String(split.slabId) },
+                orderBy: { pieceNumber: 'asc' }
+              });
+              if (slabPieces.length > 0) {
+                effectivePieceIds = slabPieces.slice(0, Number(split.qty) || slabPieces.length).map((p: any) => p.id);
+              }
+            } catch (pFindErr) {
+              console.warn('Could not find slab pieces:', split.slabId, pFindErr);
+            }
+          }
+
+          if (effectivePieceIds.length > 0) {
+            for (const pieceId of effectivePieceIds) {
+              try {
+                const cleanStage = (split.stage ? split.stage : originalLog.stage).replace(' Work', '').trim();
+                const pieceStatus = 'completed';
+                await prisma.piece.update({
+                  where: { id: pieceId },
+                  data: { 
+                    status: pieceStatus,
+                    stage: cleanStage
+                  }
+                });
+                await prisma.pieceLog.create({
+                  data: {
+                    pieceId: pieceId,
+                    stage: originalLog.stage,
+                    status: pieceStatus,
+                    operatorId: originalLog.workerId,
+                    remarks: 'Auto-logged from Material/Machine Approval',
+                    vehicleNumber: originalLog.vehicleNumber || undefined,
+                    endTime: originalLog.transactionType === 'OUT' ? undefined : new Date()
+                  }
+                });
+              } catch (pieceErr) {
+                console.warn(`Failed to update piece ${pieceId}:`, pieceErr);
+              }
+            }
+          }
+          
+          // Auto-deduct from Inventory for completed OUT items (or Production Work)
+          if (originalLog.transactionType === 'OUT' || originalLog.stage === 'Production Work') {
+            try {
+              const materialNameToMatch = String(split.productName || originalLog.productName || '').toLowerCase();
+              if (materialNameToMatch) {
+                const inventories = await prisma.inventory.findMany({});
+                const match = inventories.find(inv => 
+                  materialNameToMatch.includes(inv.itemName.toLowerCase()) || 
+                  inv.itemName.toLowerCase().includes(materialNameToMatch)
+                );
+                
+                if (match) {
+                  const qtyToDeduct = Number(split.qty);
+                  if (qtyToDeduct > 0) {
+                    await prisma.inventory.update({
+                      where: { id: match.id },
+                      data: { quantity: { decrement: qtyToDeduct } }
+                    });
+                    
+                    const proj = split.projectId ? await prisma.project.findUnique({ where: { id: String(split.projectId) } }) : null;
+                    
+                    if (split.projectId) {
+                      const pm = await prisma.projectMaterial.findFirst({
+                        where: { projectId: String(split.projectId), inventoryId: match.id, isConsumed: false }
+                      });
+                      if (pm) {
+                        const waste = Math.max(0, pm.quantity - qtyToDeduct);
+                        await prisma.projectMaterial.update({
+                          where: { id: pm.id },
+                          data: { isConsumed: true, usedQuantity: qtyToDeduct, wasteQuantity: waste }
+                        });
+                      }
+                    }
+
+                    await prisma.inventoryLog.create({
+                      data: {
+                        inventoryId: match.id,
+                        type: 'OUT',
+                        quantity: qtyToDeduct,
+                        remarks: `Used in Project: ${proj?.name || 'Unknown'}`
+                      }
+                    });
+                  }
+                }
+              }
+            } catch (invErr) {
+              console.warn('Inventory deduction warning in split approval:', invErr);
+            }
+          }
+        }
+      }
+
+      // If this is an IN log, apply the returns to pending OUT logs
+      if (originalLog.transactionType === 'IN') {
+        const pId = originalLog.parentLogId || (splits && splits[0]?.parentLogId);
+        if (pId) {
+          await syncParentOutLog(String(pId));
+        } else {
+          for (const split of splits) {
+            try {
+              let remainingToReturn = Number(split.qty);
+              const whereClause: any = {
+                transactionType: 'OUT',
+                approvalStatus: 'approved',
+                stage: originalLog.stage,
+                isReturned: { not: true }
+              };
+              if (originalLog.workerId) whereClause.workerId = originalLog.workerId;
+              else if (originalLog.vendorName) whereClause.vendorName = originalLog.vendorName;
+
+              const pendingOutLogs = await prisma.productionLog.findMany({
+                where: whereClause,
+                orderBy: { createdAt: 'asc' }
+              });
+              
+              for (const outLog of pendingOutLogs) {
+                if (remainingToReturn <= 0) break;
+                const qtyProduced = Number(outLog.quantityProduced) || 0;
+                const returnedQty = Number(outLog.returnedQty) || 0;
+                const pendingQty = qtyProduced - returnedQty;
+                if (pendingQty > 0) {
+                  const returnAmount = Math.min(pendingQty, remainingToReturn);
+                  remainingToReturn -= returnAmount;
+                  await prisma.productionLog.update({
+                    where: { id: String(id) },
+                    data: { parentLogId: outLog.id }
+                  });
+                  await syncParentOutLog(outLog.id);
+                }
+              }
+            } catch (fifoErr) {
+              console.warn('FIFO return tracking warning:', fifoErr);
+            }
+          }
+        }
+      }
+    } else {
+      // Rejection or direct approval without splits
+      const { id: _id, createdAt, updatedAt, ...restLogData } = originalLog;
+      const rejectedQty = Number(req.body.rejectedQty || originalLog.quantityProduced) || 0;
+      const rejPhoto = req.body.rejectionPhoto || req.body.startPhotos?.rejectionPhoto;
+      const mergedStartPhotos = {
+        ...(typeof originalLog.startPhotos === 'object' && originalLog.startPhotos !== null ? originalLog.startPhotos : {}),
+        ...(req.body.startPhotos || {}),
+        ...(rejPhoto ? { rejectionPhoto: rejPhoto } : {})
+      };
+
+      if (approvalStatus === 'rejected_admin' && rejectedQty < (Number(originalLog.quantityProduced) || 0) && rejectedQty > 0) {
+        // Partial rejection: split into rejected log and remaining pending log
+        const remainingQty = (Number(originalLog.quantityProduced) || 0) - rejectedQty;
+        await prisma.productionLog.update({
+          where: { id: String(id) },
+          data: { quantityProduced: remainingQty }
+        });
+
+        updatedLog = await prisma.productionLog.create({
+          data: {
+            ...restLogData,
+            approvalStatus: 'rejected_admin',
+            quantityProduced: rejectedQty,
+            remarks: remarks !== undefined ? String(remarks) : undefined,
+            startPhotos: mergedStartPhotos,
+            productName: req.body.productName || (originalLog.productName ? `${originalLog.productName.split(' - ')[0]} (${rejectedQty} Pcs)` : undefined),
+            ...(req.body.pieceIds && { pieceIds: req.body.pieceIds })
+          }
+        });
+      } else {
+        updatedLog = await prisma.productionLog.update({
+          where: { id: String(id) },
+          data: {
+            approvalStatus,
+            projectId: projectId ? String(projectId) : undefined,
+            remarks: remarks !== undefined ? String(remarks) : undefined,
+            ...(req.body.machineId && { machineId: req.body.machineId }),
+            startPhotos: mergedStartPhotos,
+            ...(req.body.pieceIds && { pieceIds: req.body.pieceIds })
+          }
+        });
+
+        // Auto-deduct from Inventory for completed OUT items (or Production Work)
+        if (approvalStatus === 'approved' && (updatedLog.transactionType === 'OUT' || updatedLog.stage === 'Production Work')) {
+          try {
+            const materialNameToMatch = String(updatedLog.productName || originalLog.productName || '').toLowerCase();
+            if (materialNameToMatch) {
+              const inventories = await prisma.inventory.findMany({});
+              const match = inventories.find(inv => 
+                materialNameToMatch.includes(inv.itemName.toLowerCase()) || 
+                inv.itemName.toLowerCase().includes(materialNameToMatch)
+              );
+              
+              if (match) {
+                const qtyToDeduct = Number(updatedLog.quantityProduced);
+                if (qtyToDeduct > 0) {
+                  await prisma.inventory.update({
+                    where: { id: match.id },
+                    data: { quantity: { decrement: qtyToDeduct } }
+                  });
+                  
+                  const proj = updatedLog.projectId ? await prisma.project.findUnique({ where: { id: String(updatedLog.projectId) } }) : null;
+                  
+                  if (updatedLog.projectId) {
+                    const pm = await prisma.projectMaterial.findFirst({
+                      where: { projectId: String(updatedLog.projectId), inventoryId: match.id, isConsumed: false }
+                    });
+                    if (pm) {
+                      const waste = Math.max(0, pm.quantity - qtyToDeduct);
+                      await prisma.projectMaterial.update({
+                        where: { id: pm.id },
+                        data: { isConsumed: true, usedQuantity: qtyToDeduct, wasteQuantity: waste }
+                      });
+                    }
+                  }
+
+                  await prisma.inventoryLog.create({
+                    data: {
+                      inventoryId: match.id,
+                      type: 'OUT',
+                      quantity: qtyToDeduct,
+                      remarks: `Used in Project Approval: ${proj?.name || 'Unknown'}`
+                    }
+                  });
+                }
+              }
+            }
+          } catch (invErr) {
+            console.warn('Inventory deduction warning in non-split approval:', invErr);
+          }
+        }
+      }
+    }
+
+    if (updatedLog && updatedLog.transactionType === 'IN' && updatedLog.parentLogId) {
+      try {
+        if (updatedLog.stage === 'Production Work') {
+          const totalApprovedQty = splits && splits.length > 0 && approvalStatus === 'approved' 
+            ? splits.reduce((acc: number, s: any) => acc + Number(s.qty || 0), 0)
+            : updatedLog.quantityProduced;
+            
+          const combinedProductName = splits && splits.length > 0 && approvalStatus === 'approved'
+            ? splits.map((s: any) => s.productName).filter(Boolean).join(' | ')
+            : updatedLog.productName;
+            
+          await prisma.machineLog.update({
+            where: { id: updatedLog.parentLogId },
+            data: { 
+              approvalStatus: approvalStatus, 
+              status: 'completed',
+              projectId: updatedLog.projectId || undefined,
+              quantityProduced: totalApprovedQty || 0,
+              productName: combinedProductName || undefined
+            }
+          });
+        } else {
+          if (updatedLog.approvalStatus === 'approved') {
+            await syncParentOutLog(String(updatedLog.parentLogId));
+          }
+        }
+      } catch (err) {
+        console.warn(`Failed to update parentLogId ${updatedLog.parentLogId}:`, err);
+      }
+    }
+
+    // Invalidate caches
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_v2');
+    fastCache.invalidate('all_names_v2');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+
+    res.json(updatedLog || originalLog);
+  } catch (error: any) {
+    console.error("Material Log Error:", error);
+    res.status(500).json({ message: error.message || 'Server error updating material log approval' });
+  }
+});
+
+// Manual Bulk Approval of Pieces for Active Work Orders
+router.post('/manual-approve-pieces', authenticate, async (req: any, res: any) => {
+  try {
+    const { projectId, slabId, pieceIds, stage, approvals, remarks = 'Manually Approved by Admin' } = req.body;
+    
+    // Normalize approval items into array of { pieceId, stage }
+    let approvalList: { pieceId: string, stage: string }[] = [];
+
+    if (Array.isArray(approvals) && approvals.length > 0) {
+      approvalList = approvals.map((a: any) => ({
+        pieceId: String(a.pieceId),
+        stage: String(a.stage || 'Production').replace(' Work', '').trim()
+      }));
+    } else if (Array.isArray(pieceIds) && pieceIds.length > 0) {
+      const defaultStage = String(stage || 'Production').replace(' Work', '').trim();
+      approvalList = pieceIds.map((pid: string) => ({
+        pieceId: String(pid),
+        stage: defaultStage
+      }));
+    }
+
+    if (approvalList.length === 0) {
+      return res.status(400).json({ message: 'No piece approvals provided' });
+    }
+
+    // Auto-create 1st inside piece for any virtual slab ID (__SLAB__<slabId>) where slab had 0 pieces
+    for (const item of approvalList) {
+      if (item.pieceId.startsWith('__SLAB__')) {
+        const targetSlabId = item.pieceId.replace('__SLAB__', '').trim();
+        const existingSlab = await prisma.slab.findUnique({
+          where: { id: targetSlabId },
+          include: { pieces: true }
+        });
+        if (existingSlab) {
+          let firstPiece = existingSlab.pieces?.[0];
+          if (!firstPiece) {
+            firstPiece = await prisma.piece.create({
+              data: {
+                slabId: existingSlab.id,
+                pieceNumber: 1,
+                productName: `${existingSlab.name || 'Slab'}.1`,
+                size: existingSlab.size || '',
+                stage: 'Production',
+                status: 'pending'
+              }
+            });
+          }
+          item.pieceId = firstPiece.id;
+        }
+      }
+    }
+
+    const uniquePieceIds = Array.from(new Set(approvalList.map(a => a.pieceId)));
+
+    // 1. Fetch pieces to get details
+    const pieces = await prisma.piece.findMany({
+      where: { id: { in: uniquePieceIds } },
+      include: { slab: true }
+    });
+
+    if (pieces.length === 0) {
+      return res.status(404).json({ message: 'No matching pieces found' });
+    }
+
+    const pieceMap = new Map(pieces.map(p => [p.id, p]));
+
+    // 2. Group approvals by stage and slab to update piece records and create clean production logs
+    const stageSlabMap: { [stage: string]: { [slabId: string]: any[] } } = {};
+
+    for (const item of approvalList) {
+      const p = pieceMap.get(item.pieceId);
+      if (!p) continue;
+      const stg = item.stage;
+      const sId = p.slabId || 'default';
+      
+      if (!stageSlabMap[stg]) stageSlabMap[stg] = {};
+      if (!stageSlabMap[stg][sId]) stageSlabMap[stg][sId] = [];
+      stageSlabMap[stg][sId].push(p);
+    }
+
+    const createdLogs = [];
+    const targetProjectId = projectId || pieces[0]?.slab?.projectId;
+
+    for (const [rawStg, slabGroups] of Object.entries(stageSlabMap)) {
+      const stg = rawStg.startsWith('Polishing') ? 'Polishing' : (rawStg.startsWith('Bridge Cutting') ? 'Bridge Cutting' : rawStg);
+      for (const [sId, groupPieces] of Object.entries(slabGroups)) {
+        if (!groupPieces || groupPieces.length === 0) continue;
+        const groupPieceIds = groupPieces.map(p => p.id);
+        const firstPiece = groupPieces[0];
+        const targetSlab = firstPiece?.slab;
+        const pieceNames = groupPieces.map(p => p.productName || `Piece ${p.pieceNumber}`).join(', ');
+
+        const isPackingStage = stg === 'Packing' || stg === 'Packing Work';
+        const isDispatchStage = stg === 'Dispatch' || stg === 'Dispatch Work';
+
+        // Update piece status and stage
+        await prisma.piece.updateMany({
+          where: { id: { in: groupPieceIds } },
+          data: {
+            status: 'completed',
+            stage: stg
+          }
+        });
+
+        // Remove any existing duplicate PieceLog / ProductionLog for these pieces at this stage
+        const stageVariants = [stg, `${stg} Work`, rawStg, `${rawStg} Work`];
+        await prisma.pieceLog.deleteMany({
+          where: {
+            pieceId: { in: groupPieceIds },
+            stage: { in: stageVariants }
+          }
+        }).catch(() => {});
+
+        await prisma.productionLog.deleteMany({
+          where: {
+            pieceIds: { hasSome: groupPieceIds },
+            stage: { in: stageVariants }
+          }
+        }).catch(() => {});
+
+        // Create approved production log for audit and In/Out tracking
+        try {
+          const log = await prisma.productionLog.create({
+            data: {
+              projectId: targetProjectId ? String(targetProjectId) : undefined,
+              slabId: targetSlab ? targetSlab.id : (sId !== 'default' ? sId : undefined),
+              productId: targetSlab?.id,
+              productName: isDispatchStage 
+                ? `Dispatch - Manual (${groupPieces.length} Pieces)` 
+                : (isPackingStage ? `Box - Manual` : (targetSlab ? `${targetSlab.name} - ${pieceNames}` : pieceNames)),
+              pieceIds: groupPieceIds,
+              quantityProduced: groupPieces.length,
+              stage: isDispatchStage ? 'Dispatch' : (isPackingStage ? 'Packing' : (stg.includes('Work') ? stg : `${stg} Work`)),
+              boxCode: isPackingStage ? 'Box - Manual | Standard' : (isDispatchStage ? 'Manual Box' : undefined),
+              vehicleNumber: isDispatchStage ? 'Manual' : undefined,
+              vendorName: isDispatchStage ? 'Manual' : undefined,
+              challanNumber: isDispatchStage ? 'Manual' : undefined,
+              transactionType: isDispatchStage ? 'OUT' : 'IN',
+              approvalStatus: 'approved',
+              remarks: 'Manual Approval',
+              workerId: req.user?.id ? String(req.user.id) : undefined
+            }
+          });
+          createdLogs.push(log);
+        } catch (logErr) {
+          console.warn('Could not create ProductionLog record during manual approval:', logErr);
+        }
+
+        // Also create PieceLog entries in a single fast bulk insert
+        try {
+          const pieceLogsData = groupPieces.map(p => ({
+            pieceId: p.id,
+            stage: stg,
+            status: 'approved',
+            driverName: isDispatchStage ? 'Manual' : undefined,
+            operatorId: req.user?.id ? String(req.user.id) : undefined,
+            remarks: 'Manual Approval',
+            endTime: new Date()
+          }));
+          if (pieceLogsData.length > 0) {
+            await prisma.pieceLog.createMany({ data: pieceLogsData });
+          }
+        } catch (plErr) {
+          console.warn('PieceLog createMany warning:', plErr);
+        }
+      }
+    }
+
+    // Invalidate caches
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('project_hierarchy_v2');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+
+    res.json({
+      success: true,
+      message: `Successfully approved ${approvalList.length} stage item(s) across ${uniquePieceIds.length} piece(s)`,
+      count: approvalList.length,
+      logs: createdLogs
+    });
+  } catch (error: any) {
+    console.error('Manual piece approval error:', error);
+    res.status(500).json({ message: error.message || 'Server error during manual piece approval' });
+  }
+});
+
+// Create and save boxes for Packing Workspace
+router.post('/pack-boxes', authenticate, async (req: any, res: any) => {
+  try {
+    const { projectId, slabId, boxes } = req.body;
+    if (!Array.isArray(boxes) || boxes.length === 0) {
+      return res.status(400).json({ message: 'No boxes provided' });
+    }
+
+    const createdLogs = [];
+    for (const b of boxes) {
+      const pieceIds = Array.isArray(b.pieceIds) ? b.pieceIds.map(String) : [];
+      if (pieceIds.length === 0) continue;
+
+      // Defensive check: avoid duplicate log creation within 15 seconds for identical pieceIds
+      const recentLog = await prisma.productionLog.findFirst({
+        where: {
+          stage: 'Packing',
+          projectId: projectId ? String(projectId) : undefined,
+          createdAt: { gte: new Date(Date.now() - 15000) }
+        }
+      });
+      if (recentLog && Array.isArray(recentLog.pieceIds) && pieceIds.length === recentLog.pieceIds.length && pieceIds.every((id: string) => recentLog.pieceIds.includes(id))) {
+        console.log('Skipping duplicate pack-boxes request within 15s');
+        continue;
+      }
+
+      const boxName = b.boxName || 'Box';
+      const boxDisplayName = b.boxSize ? `${boxName} | ${b.boxSize}` : boxName;
+
+      // 1. Create ProductionLog for Box
+      const log = await prisma.productionLog.create({
+        data: {
+          projectId: projectId ? String(projectId) : undefined,
+          slabId: slabId ? String(slabId) : undefined,
+          productId: slabId ? String(slabId) : undefined,
+          productName: boxDisplayName,
+          stage: 'Packing',
+          boxCode: boxDisplayName,
+          pieceIds,
+          quantityProduced: pieceIds.length,
+          transactionType: 'IN',
+          approvalStatus: 'approved',
+          remarks: b.remarks || `${boxDisplayName} • ${pieceIds.length} Pieces`,
+          workerId: req.user?.id ? String(req.user.id) : undefined
+        }
+      });
+      createdLogs.push(log);
+
+      // 2. Create PieceLog for each piece
+      const pieceLogsData = pieceIds.map((pid: string) => ({
+        pieceId: pid,
+        stage: 'Packing',
+        status: 'approved',
+        remarks: boxDisplayName,
+        operatorId: req.user?.id ? String(req.user.id) : undefined,
+        endTime: new Date()
+      }));
+      await prisma.pieceLog.createMany({ data: pieceLogsData });
+
+      // 3. Update Piece stage & status
+      await prisma.piece.updateMany({
+        where: { id: { in: pieceIds } },
+        data: {
+          status: 'completed',
+          stage: 'Packing'
+        }
+      });
+    }
+
+    // Invalidate caches
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('project_hierarchy_v2');
+
+    res.json({ success: true, message: `Successfully packed ${boxes.length} box(es)`, logs: createdLogs });
+  } catch (error: any) {
+    console.error('Error packing boxes:', error);
+    res.status(500).json({ message: error.message || 'Server error packing boxes' });
+  }
+});
+
+// Complete Dispatch for Packed Boxes
+router.post('/dispatch-boxes', authenticate, async (req: any, res: any) => {
+  try {
+    const { projectId, slabId, boxCodes, pieceIds, vehicleNumber, driverName, dispatchDate, lrNumber, remarks } = req.body;
+    
+    const pIds = Array.isArray(pieceIds) ? pieceIds.map(String) : [];
+    const boxesStr = Array.isArray(boxCodes) ? boxCodes.join(', ') : (boxCodes || 'Boxes');
+
+    const log = await prisma.productionLog.create({
+      data: {
+        projectId: projectId ? String(projectId) : undefined,
+        slabId: slabId ? String(slabId) : undefined,
+        productId: slabId ? String(slabId) : undefined,
+        productName: `Dispatch - ${boxesStr}`,
+        stage: 'Dispatch',
+        boxCode: boxesStr,
+        vehicleNumber: vehicleNumber || undefined,
+        challanNumber: lrNumber || undefined,
+        vendorName: driverName || undefined,
+        pieceIds: pIds,
+        quantityProduced: pIds.length,
+        transactionType: 'OUT',
+        approvalStatus: 'approved',
+        remarks: remarks || `Vehicle: ${vehicleNumber || '-'}, Driver: ${driverName || '-'}${lrNumber ? `, LR: ${lrNumber}` : ''}`,
+        workerId: req.user?.id ? String(req.user.id) : undefined,
+        startTime: dispatchDate ? new Date(dispatchDate) : new Date()
+      }
+    });
+
+    if (pIds.length > 0) {
+      const pieceLogsData = pIds.map((pid: string) => ({
+        pieceId: pid,
+        stage: 'Dispatch',
+        status: 'approved',
+        driverName: driverName || undefined,
+        remarks: `Dispatched with Vehicle ${vehicleNumber || '-'}`,
+        operatorId: req.user?.id ? String(req.user.id) : undefined,
+        endTime: new Date()
+      }));
+      await prisma.pieceLog.createMany({ data: pieceLogsData });
+
+      await prisma.piece.updateMany({
+        where: { id: { in: pIds } },
+        data: {
+          status: 'completed',
+          stage: 'Dispatch'
+        }
+      });
+    }
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('project_hierarchy_v2');
+
+    res.json({ success: true, message: 'Dispatch completed successfully', log });
+  } catch (error: any) {
+    console.error('Error completing dispatch:', error);
+    res.status(500).json({ message: error.message || 'Server error completing dispatch' });
+  }
+});
+
+// Fetch approved material logs for Production Management
+router.get('/approved-logs', authenticate, async (req, res) => {
+  try {
+    const cached = fastCache.get('prod_approved_logs');
+    if (cached) return res.json(cached);
+
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const rawApproved = await db.collection('ProductionLog').find({ approvalStatus: 'approved' })
+          .sort({ createdAt: -1 })
+          .limit(200)
+          .toArray();
+
+        const workerIds = rawApproved.map((l: any) => l.workerId).filter(Boolean);
+        const projectIds = rawApproved.map((l: any) => l.projectId).filter(Boolean);
+
+        const [rawWorkers, rawProjects] = await Promise.all([
+          db.collection('User').find({ _id: { $in: workerIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }, { projection: { name: 1 } }).toArray(),
+          db.collection('Project').find({ _id: { $in: projectIds.map((id: any) => { try { return new mongoose.Types.ObjectId(id); } catch { return id; } }) } }, { projection: { name: 1, projectId: 1, clientName: 1 } }).toArray()
+        ]);
+
+        const workerMap = new Map();
+        rawWorkers.forEach((w: any) => workerMap.set(w._id.toString(), { name: w.name }));
+
+        const projectMap = new Map();
+        rawProjects.forEach((p: any) => projectMap.set(p._id.toString(), { name: p.name, projectId: p.projectId, clientName: p.clientName }));
+
+        const approvedLogs = rawApproved.map((l: any) => ({
+          ...l,
+          id: l._id.toString(),
+          worker: l.workerId ? workerMap.get(l.workerId.toString()) : null,
+          project: l.projectId ? projectMap.get(l.projectId.toString()) : null
+        }));
+
+        fastCache.set('prod_approved_logs', approvedLogs, 15);
+        return res.json(approvedLogs);
+      } catch (mErr) {
+        console.warn('Mongoose approved logs error, falling back:', mErr);
+      }
+    }
+
+    const approvedLogs = await Promise.race([
+      prisma.productionLog.findMany({
+        where: { approvalStatus: 'approved' },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+        include: {
+          worker: { select: { name: true } },
+          project: { select: { name: true, projectId: true, clientName: true } }
+        }
+      }),
+      new Promise<any[]>((_, reject) => setTimeout(() => reject(new Error('Prisma timeout')), 3000))
+    ]).catch(() => []);
+
+    fastCache.set('prod_approved_logs', approvedLogs, 15);
+    res.json(approvedLogs);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching approved logs' });
+  }
+});
+
+// Update returnedQty for partial/full returns on OUT material logs
+router.patch('/:id/return', authenticate, async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    const { returnedQty, returnDate } = req.body;
+
+    const log = await prisma.productionLog.findUnique({ where: { id: String(id) } });
+    if (!log) return res.status(404).json({ message: 'Log not found' });
+
+    const prevReturned = (log as any).returnedQty || 0;
+    const newReturnedQty = prevReturned + Number(returnedQty || 0);
+    const isFullyReturned = newReturnedQty >= (log.quantityProduced || 0);
+
+    const updated = await prisma.productionLog.update({
+      where: { id: String(id) },
+      data: {
+        returnedQty: newReturnedQty,
+        isReturned: isFullyReturned,
+        returnDate: returnDate ? new Date(returnDate) : new Date()
+      } as any
+    });
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error recording material return' });
+  }
+});
+
+// Edit material log
+router.put('/:id', authenticate, async (req, res) => {
+  try {
+    const { quantityProduced, returnedQty, stage, projectId, productId, productName, slabId, pieceIds, vehicleNumber, transactionType, vendorId, vendorName, workerId, workerName, date, photoUrl, startPhotos } = req.body;
+    
+    // Get the log first to know its type and stage
+    const log = await prisma.productionLog.findUnique({ where: { id: req.params.id as string } });
+    if (!log) return res.status(404).json({ message: 'Log not found' });
+    
+    let updateData: any = {
+      quantityProduced: quantityProduced !== undefined ? Number(quantityProduced) : undefined,
+      returnedQty: returnedQty !== undefined ? Number(returnedQty) : undefined,
+      stage: stage ? String(stage) : undefined,
+      projectId: projectId ? String(projectId) : undefined,
+      productId: productId ? String(productId) : undefined,
+      productName: productName ? String(productName) : undefined,
+      slabId: slabId ? String(slabId) : undefined,
+      pieceIds: pieceIds ? pieceIds : undefined,
+      vehicleNumber: vehicleNumber !== undefined ? String(vehicleNumber) : undefined,
+      transactionType: transactionType ? String(transactionType) : undefined,
+      vendorId: vendorId !== undefined ? String(vendorId) : undefined,
+      vendorName: vendorName !== undefined ? String(vendorName) : undefined,
+      workerId: workerId !== undefined ? String(workerId) : undefined,
+    };
+
+    if (date) {
+      updateData.createdAt = new Date(date);
+    }
+    
+    if (startPhotos) {
+      updateData.startPhotos = await sanitizePhotos(startPhotos);
+    }
+
+    if (req.body.photoUrls) {
+      let pUrls = req.body.photoUrls;
+      if (!Array.isArray(pUrls)) pUrls = [pUrls];
+      pUrls = await sanitizePhotos(pUrls);
+      if (!updateData.startPhotos || typeof updateData.startPhotos !== 'object') {
+        updateData.startPhotos = { unit: pUrls[0], machine: pUrls[0], photos: pUrls };
+      } else {
+        updateData.startPhotos.photos = pUrls;
+      }
+      updateData.photoUrl = pUrls[0] || undefined;
+    } else if (photoUrl) {
+      let singlePhoto = photoUrl;
+      if (typeof singlePhoto === 'string' && singlePhoto.startsWith('data:image/')) {
+        singlePhoto = await uploadBase64ToCloudinary(singlePhoto);
+      }
+      updateData.photoUrl = singlePhoto;
+    }
+
+    if (req.body.remarks !== undefined) {
+      updateData.remarks = req.body.remarks?.trim() || undefined;
+    }
+
+    const updated = await prisma.productionLog.update({
+      where: { id: req.params.id as string },
+      data: updateData
+    });
+    
+    // If pieceIds were provided and the log is approved, update the pieces!
+    if (pieceIds && Array.isArray(pieceIds) && log.approvalStatus === 'approved') {
+        for (const pieceId of pieceIds) {
+           const pieceStatus = 'completed';
+           await prisma.piece.update({
+              where: { id: String(pieceId) },
+              data: {
+                 status: pieceStatus,
+                 stage: log.stage.replace(' Work', '').trim()
+              }
+           });
+        }
+    }
+    
+    if (log.transactionType === 'IN' && log.parentLogId) {
+      await syncParentOutLog(String(log.parentLogId));
+    }
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_v2');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error editing material log' });
+  }
+});
+
+// Delete material log
+router.delete('/:id', authenticate, async (req, res) => {
+  try {
+    const logToDelete = await prisma.productionLog.findUnique({ where: { id: req.params.id as string } });
+    if (!logToDelete) {
+      return res.status(404).json({ message: 'Log not found' });
+    }
+
+    await prisma.productionLog.delete({
+      where: { id: req.params.id as string }
+    });
+
+    if (logToDelete?.transactionType === 'IN' && logToDelete.parentLogId) {
+      await syncParentOutLog(String(logToDelete.parentLogId));
+    }
+
+    const deletedStage = (logToDelete?.stage || '').replace(' Work', '').trim();
+    const deletedStagePrefix = deletedStage.split(' ')[0] || deletedStage;
+
+    // Determine affected pieces
+    let targetPieceIds: string[] = Array.isArray(logToDelete.pieceIds) && logToDelete.pieceIds.length > 0 ? logToDelete.pieceIds : [];
+    const slabId = logToDelete.slabId || logToDelete.productId;
+
+    if (targetPieceIds.length === 0 && slabId) {
+      const slabPieces = await prisma.piece.findMany({
+        where: { slabId: String(slabId) },
+        select: { id: true }
+      });
+      targetPieceIds = slabPieces.map(p => p.id);
+    }
+
+    if (targetPieceIds.length > 0) {
+      // 1. Delete piece logs for this stage
+      await prisma.pieceLog.deleteMany({
+        where: {
+          pieceId: { in: targetPieceIds },
+          stage: { startsWith: deletedStagePrefix }
+        }
+      });
+
+      // 2. Re-evaluate piece status for each piece
+      for (const pId of targetPieceIds) {
+        const remainingApprovedLogs = await prisma.pieceLog.findMany({
+          where: { pieceId: pId, status: { in: ['approved', 'completed'] } },
+          orderBy: { createdAt: 'desc' }
+        });
+
+        if (remainingApprovedLogs.length === 0) {
+          await prisma.piece.update({
+            where: { id: pId },
+            data: {
+              status: 'pending',
+              stage: 'Production'
+            }
+          });
+        } else {
+          await prisma.piece.update({
+            where: { id: pId },
+            data: {
+              status: 'pending',
+              stage: deletedStage || remainingApprovedLogs[0]?.stage || 'Production'
+            }
+          });
+        }
+      }
+    }
+
+    // 3. Re-evaluate slab status
+    if (slabId) {
+      const allSlabPieces = await prisma.piece.findMany({
+        where: { slabId: String(slabId) },
+        select: { status: true }
+      });
+
+      if (allSlabPieces.length > 0) {
+        const allCompleted = allSlabPieces.every(p => p.status === 'completed' || p.status === 'approved');
+        const allPending = allSlabPieces.every(p => p.status === 'pending' || p.status === 'not_started');
+        const newSlabStatus = allCompleted ? 'completed' : (allPending ? 'not_started' : 'in_production');
+
+        await prisma.slab.update({
+          where: { id: String(slabId) },
+          data: { status: newSlabStatus }
+        });
+      }
+    }
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_v2');
+    fastCache.invalidate('vendors_stats');
+    fastCache.invalidate('vendor_ledger_');
+    res.json({ message: 'Material log deleted and piece progress reverted successfully' });
+  } catch (error) {
+    console.error('Error deleting material log:', error);
+    res.status(500).json({ message: 'Server error deleting material log' });
+  }
+});
+
+// -------------------------------------------------------------
+// Quick Direct Actions: Quick Complete Piece, Revert, Edit Log
+// -------------------------------------------------------------
+
+// Quick Complete Piece (+ Action)
+router.post('/quick-complete-piece', authenticate, async (req: any, res: any) => {
+  try {
+    const { slabId, pieceId, machineId, driverName, photoUrl, stage = 'Production', remarks } = req.body;
+    if (!slabId) {
+      return res.status(400).json({ message: 'slabId is required' });
+    }
+
+    const slab = await prisma.slab.findUnique({
+      where: { id: slabId },
+      include: { pieces: { orderBy: { pieceNumber: 'asc' } }, project: true }
+    });
+
+    if (!slab) {
+      return res.status(404).json({ message: 'Slab not found' });
+    }
+
+    const rawStage = String(stage || 'Production').replace(' Work', '').trim();
+    const normalizedStage = rawStage.startsWith('Polishing')
+      ? 'Polishing'
+      : (rawStage.startsWith('Bridge Cutting') ? 'Bridge Cutting' : rawStage);
+
+    // Determine target piece
+    let piece: any = null;
+    if (pieceId === 'new') {
+      const currentMax = (slab.pieces || []).reduce((max: number, p: any) => Math.max(max, p.pieceNumber || 0), 0);
+      piece = await prisma.piece.create({
+        data: {
+          slabId: slab.id,
+          pieceNumber: currentMax + 1,
+          productName: `${slab.name}.${currentMax + 1}`,
+          size: slab.size || '',
+          status: 'completed',
+          stage: normalizedStage
+        }
+      });
+    } else if (pieceId) {
+      piece = slab.pieces.find((p: any) => p.id === pieceId);
+    } else {
+      // Find piece where this stage is not yet completed
+      piece = slab.pieces.find((p: any) => p.status !== 'completed' && p.status !== 'approved');
+      if (!piece && slab.pieces.length === 0) {
+        piece = await prisma.piece.create({
+          data: {
+            slabId: slab.id,
+            pieceNumber: 1,
+            productName: `${slab.name}.1`,
+            size: slab.size || '',
+            status: 'completed',
+            stage: normalizedStage
+          }
+        });
+      } else if (!piece) {
+        piece = slab.pieces[0];
+      }
+    }
+
+    if (!piece) {
+      return res.status(400).json({ message: 'No piece available to complete' });
+    }
+
+    const targetStatus = (req.body.status === 'pending' || req.body.status === 'not_started') 
+      ? 'pending' 
+      : (req.body.status === 'in_progress' || req.body.status === 'active')
+      ? 'in_progress'
+      : 'completed';
+
+    const now = new Date();
+    const parseClientTime = (val: any, fallback: Date): Date => {
+      if (!val) return fallback;
+      const str = String(val).trim();
+      const d = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(str)
+        ? new Date(`${str}+05:30`)
+        : new Date(str);
+      if (isNaN(d.getTime()) || d.getTime() > now.getTime() + 60000) return fallback;
+      return d;
+    };
+    const parsedStartTime = parseClientTime(req.body.startTime, now);
+    const parsedEndTime = now; // Approval / completion time is always current time only
+
+    const pieceUpdateData: any = {
+      status: targetStatus,
+      stage: normalizedStage
+    };
+    if (req.body.productName) pieceUpdateData.productName = req.body.productName;
+    if (req.body.size) {
+      const slabArea = Math.round(parsePieceAreaSqFt(slab.size) * 100) / 100;
+      const newPieceArea = Math.round(parsePieceAreaSqFt(req.body.size) * 100) / 100;
+      const otherPiecesArea = Math.round(
+        (slab.pieces || [])
+          .filter((p: any) => p.id !== piece.id)
+          .reduce((acc: number, p: any) => acc + parsePieceAreaSqFt(p.size), 0) * 100
+      ) / 100;
+      const totalArea = Math.round((otherPiecesArea + newPieceArea) * 100) / 100;
+      if (slabArea > 0 && newPieceArea > 0 && totalArea > slabArea + 0.01) {
+        return res.status(400).json({
+          message: `Total piece area (${totalArea.toFixed(2)} Sq.Ft) exceeds allowed slab limit (${slabArea.toFixed(2)} Sq.Ft)!`
+        });
+      }
+      pieceUpdateData.size = req.body.size;
+    }
+
+    // 1. Update piece status, name, size and stage
+    const updatedPiece = await prisma.piece.update({
+      where: { id: piece.id },
+      data: pieceUpdateData
+    });
+
+    let pieceLog: any = null;
+    let machineLogRecord: any = null;
+
+    if (targetStatus === 'in_progress') {
+      // Machine is turned ON (In Progress)
+      if (machineId) {
+        const existingMLog = await prisma.machineLog.findFirst({
+          where: {
+            productId: piece.id,
+            status: 'active'
+          }
+        });
+
+        if (existingMLog) {
+          machineLogRecord = await prisma.machineLog.update({
+            where: { id: existingMLog.id },
+            data: {
+              machineId: String(machineId),
+              startTime: parsedStartTime,
+              remarks: remarks || `Machine ON in Active Work Orders`,
+              operatorId: req.user?.id ? String(req.user.id) : existingMLog.operatorId
+            }
+          });
+        } else {
+          machineLogRecord = await prisma.machineLog.create({
+            data: {
+              machineId: String(machineId),
+              projectId: slab.projectId,
+              productId: piece.id,
+              productName: `${slab.name} - Piece ${piece.pieceNumber}`,
+              startTime: parsedStartTime,
+              status: 'active',
+              approvalStatus: 'in_progress',
+              operatorId: req.user?.id ? String(req.user.id) : undefined,
+              machinePhotoUrl: photoUrl || undefined,
+              unitPhotoUrl: photoUrl || undefined,
+              remarks: remarks || `Machine ON in Active Work Orders`
+            }
+          });
+        }
+
+        // Set machine status to running
+        await prisma.machine.update({
+          where: { id: String(machineId) },
+          data: { status: 'running' }
+        }).catch(() => {});
+      }
+
+      // Create PieceLog for In Progress
+      pieceLog = await prisma.pieceLog.create({
+        data: {
+          pieceId: piece.id,
+          stage: normalizedStage,
+          status: 'in_progress',
+          machineId: machineId ? String(machineId) : undefined,
+          operatorId: req.user?.id ? String(req.user.id) : undefined,
+          startPhotoUrl: photoUrl || undefined,
+          startTime: parsedStartTime,
+          remarks: remarks || `Machine ON in Active Work Orders`
+        }
+      });
+
+      // Create linked production log for tracking
+      try {
+        await prisma.productionLog.create({
+          data: {
+            projectId: slab.projectId,
+            slabId: slab.id,
+            productId: slab.id,
+            productName: `${slab.name} - Piece ${piece.pieceNumber}`,
+            pieceIds: [piece.id],
+            quantityProduced: 0,
+            stage: normalizedStage.includes('Work') ? normalizedStage : `${normalizedStage} Work`,
+            transactionType: 'IN',
+            approvalStatus: 'pending',
+            startPhotos: photoUrl ? { unit: photoUrl, machine: photoUrl } : undefined,
+            machineId: machineId ? String(machineId) : undefined,
+            workerId: req.user?.id ? String(req.user.id) : undefined,
+            parentLogId: machineLogRecord?.id,
+            remarks: remarks || `Machine ON: ${normalizedStage}`
+          }
+        });
+      } catch (logErr) {
+        console.warn('ProductionLog in_progress warning:', logErr);
+      }
+    } else if (targetStatus === 'completed') {
+      // Machine is turned OFF (Completed)
+      if (machineId) {
+        const existingMLog = await prisma.machineLog.findFirst({
+          where: {
+            productId: piece.id,
+            status: 'active'
+          }
+        });
+
+        const effectiveStartTime = existingMLog?.startTime || parsedStartTime;
+        const durationHours = Math.max(0.1, (parsedEndTime.getTime() - new Date(effectiveStartTime).getTime()) / (1000 * 60 * 60));
+
+        if (existingMLog) {
+          machineLogRecord = await prisma.machineLog.update({
+            where: { id: existingMLog.id },
+            data: {
+              endTime: parsedEndTime,
+              status: 'completed',
+              approvalStatus: 'approved',
+              quantityProduced: 1,
+              endUnitPhotoUrl: photoUrl || undefined,
+              endMachinePhotoUrl: photoUrl || undefined,
+              remarks: remarks ? `${existingMLog.remarks || ''}\nOut: ${remarks}`.trim() : (existingMLog.remarks || 'Machine OFF in Active Work Orders')
+            }
+          });
+        } else {
+          // Direct Complete - Create completed MachineLog so LogBook gets entry with On Time/Date and End Time/Date
+          machineLogRecord = await prisma.machineLog.create({
+            data: {
+              machineId: String(machineId),
+              projectId: slab.projectId,
+              productId: piece.id,
+              productName: `${slab.name} - Piece ${piece.pieceNumber}`,
+              startTime: parsedStartTime,
+              endTime: parsedEndTime,
+              status: 'completed',
+              approvalStatus: 'approved',
+              quantityProduced: 1,
+              operatorId: req.user?.id ? String(req.user.id) : undefined,
+              machinePhotoUrl: photoUrl || undefined,
+              unitPhotoUrl: photoUrl || undefined,
+              endMachinePhotoUrl: photoUrl || undefined,
+              endUnitPhotoUrl: photoUrl || undefined,
+              remarks: remarks || `Machine OFF / Completed in Active Work Orders`
+            }
+          });
+        }
+
+        // Update machine total hours and set to idle
+        await prisma.machine.update({
+          where: { id: String(machineId) },
+          data: { 
+            status: 'idle',
+            totalRunHours: { increment: durationHours }
+          }
+        }).catch(() => {});
+      }
+
+      // 2. Upsert single PieceLog for this piece + stage (never create duplicates)
+      const stageMatchList = normalizedStage === 'Polishing'
+        ? ['Polishing', 'Polishing - Honed', 'Polishing - Mirror', 'Polishing Work', 'Polishing - Honed Work', 'Polishing - Mirror Work']
+        : [normalizedStage, `${normalizedStage} Work`];
+
+      const existingPieceLogs = await prisma.pieceLog.findMany({
+        where: {
+          pieceId: piece.id,
+          stage: { in: stageMatchList }
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      if (existingPieceLogs.length > 0) {
+        const primaryLog = existingPieceLogs[0]!;
+        if (existingPieceLogs.length > 1) {
+          const extraIds = existingPieceLogs.slice(1).map(l => l.id);
+          await prisma.pieceLog.deleteMany({ where: { id: { in: extraIds } } }).catch(() => {});
+        }
+        pieceLog = await prisma.pieceLog.update({
+          where: { id: primaryLog.id },
+          data: {
+            stage: normalizedStage,
+            status: 'approved',
+            machineId: machineId ? String(machineId) : primaryLog.machineId,
+            driverName: driverName ? String(driverName) : primaryLog.driverName,
+            operatorId: req.user?.id ? String(req.user.id) : primaryLog.operatorId,
+            startPhotoUrl: photoUrl || primaryLog.startPhotoUrl || undefined,
+            endPhotoUrl: photoUrl || primaryLog.endPhotoUrl || undefined,
+            startTime: parsedStartTime,
+            endTime: parsedEndTime,
+            remarks: remarks || primaryLog.remarks || (driverName ? `Completed by Driver: ${driverName}` : `Quick Completed for ${normalizedStage}`)
+          }
+        });
+      } else {
+        pieceLog = await prisma.pieceLog.create({
+          data: {
+            pieceId: piece.id,
+            stage: normalizedStage,
+            status: 'approved',
+            machineId: machineId ? String(machineId) : undefined,
+            driverName: driverName ? String(driverName) : undefined,
+            operatorId: req.user?.id ? String(req.user.id) : undefined,
+            startPhotoUrl: photoUrl || undefined,
+            endPhotoUrl: photoUrl || undefined,
+            startTime: parsedStartTime,
+            endTime: parsedEndTime,
+            remarks: remarks || (driverName ? `Completed by Driver: ${driverName}` : `Quick Completed for ${normalizedStage}`)
+          }
+        });
+      }
+
+      // 3. Upsert single ProductionLog for traceability & In/Out Ledger (never create duplicates)
+      try {
+        const existingProdLogs = await prisma.productionLog.findMany({
+          where: {
+            pieceIds: { has: piece.id },
+            stage: { in: stageMatchList }
+          },
+          orderBy: { createdAt: 'desc' }
+        });
+
+        if (existingProdLogs.length > 0) {
+          const primaryProdLog = existingProdLogs[0]!;
+          if (existingProdLogs.length > 1) {
+            const extraProdIds = existingProdLogs.slice(1).map(l => l.id);
+            await prisma.productionLog.deleteMany({ where: { id: { in: extraProdIds } } }).catch(() => {});
+          }
+          await prisma.productionLog.update({
+            where: { id: primaryProdLog.id },
+            data: {
+              stage: `${normalizedStage} Work`,
+              approvalStatus: 'approved',
+              startPhotos: photoUrl ? { unit: photoUrl, machine: photoUrl } : (primaryProdLog.startPhotos as any) || undefined,
+              machineId: machineId ? String(machineId) : primaryProdLog.machineId,
+              workerId: req.user?.id ? String(req.user.id) : primaryProdLog.workerId,
+              parentLogId: machineLogRecord?.id || primaryProdLog.parentLogId,
+              remarks: remarks || primaryProdLog.remarks || (driverName ? `Driver: ${driverName}` : `Quick Direct Complete: ${normalizedStage}`)
+            }
+          });
+        } else {
+          await prisma.productionLog.create({
+            data: {
+              projectId: slab.projectId,
+              slabId: slab.id,
+              productId: slab.id,
+              productName: `${slab.name} - Piece ${piece.pieceNumber}`,
+              pieceIds: [piece.id],
+              quantityProduced: 1,
+              stage: `${normalizedStage} Work`,
+              transactionType: 'IN',
+              approvalStatus: 'approved',
+              startPhotos: photoUrl ? { unit: photoUrl, machine: photoUrl } : undefined,
+              machineId: machineId ? String(machineId) : undefined,
+              workerId: req.user?.id ? String(req.user.id) : undefined,
+              parentLogId: machineLogRecord?.id,
+              remarks: remarks || (driverName ? `Driver: ${driverName}` : `Quick Direct Complete: ${normalizedStage}`)
+            }
+          });
+        }
+      } catch (logErr) {
+        console.warn('ProductionLog creation warning:', logErr);
+      }
+    } else {
+      // If Not Started, remove previous completion and machine logs so stage progress drops back immediately!
+      await prisma.machineLog.deleteMany({
+        where: { productId: piece.id }
+      }).catch(() => {});
+      await prisma.pieceLog.deleteMany({
+        where: { pieceId: piece.id }
+      }).catch(() => {});
+      await prisma.productionLog.deleteMany({
+        where: {
+          OR: [
+            { pieceIds: { has: piece.id } },
+            { productId: piece.id }
+          ]
+        }
+      }).catch(() => {});
+    }
+
+    // Invalidate Machine & Production caches so LogBook updates immediately!
+    fastCache.invalidate('all_machine_logs');
+    fastCache.invalidate('daily_machine_logs');
+    fastCache.invalidate('live_feed');
+
+    // Optional: Update slab name / size if passed
+    if (req.body.slabName || req.body.slabSize) {
+      await prisma.slab.update({
+        where: { id: slab.id },
+        data: {
+          ...(req.body.slabName ? { name: req.body.slabName } : {}),
+          ...(req.body.slabSize ? { size: req.body.slabSize } : {})
+        }
+      }).catch(() => {});
+    }
+
+    // Sync slab status
+    const allPieces = await prisma.piece.findMany({ where: { slabId: slab.id } });
+    const completedCount = allPieces.filter(p => p.status === 'completed').length;
+    let newSlabStatus = 'not_started';
+    if (completedCount === allPieces.length && allPieces.length > 0) {
+      newSlabStatus = 'completed';
+    } else if (completedCount > 0) {
+      newSlabStatus = 'in_production';
+    }
+    await prisma.slab.update({
+      where: { id: slab.id },
+      data: { status: newSlabStatus }
+    }).catch(() => {});
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_');
+
+    res.json({
+      success: true,
+      message: `Piece ${piece.pieceNumber} marked as completed for ${normalizedStage}`,
+      piece: updatedPiece,
+      log: pieceLog
+    });
+  } catch (error: any) {
+    console.error('Quick complete piece error:', error);
+    res.status(500).json({ message: error.message || 'Server error completing piece' });
+  }
+});
+
+// Quick Revert Piece (- Action)
+router.post('/quick-revert-piece', authenticate, async (req: any, res: any) => {
+  try {
+    const { slabId, pieceId, stage, revertAll } = req.body;
+    if (!slabId) {
+      return res.status(400).json({ message: 'slabId is required' });
+    }
+
+    const slab = await prisma.slab.findUnique({
+      where: { id: slabId },
+      include: { pieces: { orderBy: { pieceNumber: 'asc' } } }
+    });
+
+    if (!slab || !slab.pieces || slab.pieces.length === 0) {
+      return res.status(404).json({ message: 'Slab or pieces not found' });
+    }
+
+    let piece: any = null;
+    if (pieceId) {
+      piece = slab.pieces.find((p: any) => p.id === pieceId);
+    } else {
+      // Find the last completed or in-progress piece
+      piece = slab.pieces.slice().reverse().find((p: any) => p.status === 'completed' || p.status === 'approved' || p.status === 'in_progress') || slab.pieces[slab.pieces.length - 1];
+    }
+
+    if (!piece) {
+      return res.status(400).json({ message: 'No piece found to revert' });
+    }
+
+    if (revertAll) {
+      // Delete all PieceLogs for this piece
+      await prisma.pieceLog.deleteMany({ where: { pieceId: piece.id } });
+
+      // Delete ProductionLogs containing this piece
+      try {
+        await prisma.productionLog.deleteMany({
+          where: {
+            slabId: slab.id,
+            pieceIds: { has: piece.id }
+          }
+        });
+      } catch (e) {
+        console.warn('ProductionLog revert delete warning:', e);
+      }
+
+      const updatedPiece = await prisma.piece.update({
+        where: { id: piece.id },
+        data: {
+          status: 'pending',
+          stage: slab.requiredStages?.[0] || 'Production'
+        }
+      });
+
+      fastCache.invalidate('prod_');
+      fastCache.invalidate('all_projects');
+      fastCache.invalidate('slabs_project_');
+      fastCache.invalidate('project_hierarchy_v2');
+
+      return res.json({
+        success: true,
+        message: `Piece #${piece.pieceNumber} completely reverted to pending!`,
+        piece: updatedPiece
+      });
+    }
+
+    // Single stage or latest stage revert
+    let logToDelete: any = null;
+    if (stage) {
+      const norm = stage.split(' - ')[0].replace(' Work', '').trim();
+      logToDelete = await prisma.pieceLog.findFirst({
+        where: {
+          pieceId: piece.id,
+          stage: { contains: norm, mode: 'insensitive' }
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+    }
+    if (!logToDelete) {
+      logToDelete = await prisma.pieceLog.findFirst({
+        where: { pieceId: piece.id },
+        orderBy: { createdAt: 'desc' }
+      });
+    }
+
+    if (logToDelete) {
+      await prisma.pieceLog.delete({ where: { id: logToDelete.id } });
+
+      // Delete matching ProductionLog for this piece & stage
+      try {
+        const norm = (logToDelete.stage || '').split(' - ')[0].replace(' Work', '').trim();
+        const prodLog = await prisma.productionLog.findFirst({
+          where: {
+            slabId: slab.id,
+            pieceIds: { has: piece.id },
+            stage: { contains: norm, mode: 'insensitive' }
+          },
+          orderBy: { createdAt: 'desc' }
+        });
+        if (prodLog) {
+          await prisma.productionLog.delete({ where: { id: prodLog.id } });
+        }
+      } catch (plErr) {
+        console.warn('ProductionLog delete warning:', plErr);
+      }
+    }
+
+    // Check remaining PieceLogs for this piece
+    const remainingLogs = await prisma.pieceLog.findMany({
+      where: { pieceId: piece.id },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    let updatedStage = slab.requiredStages?.[0] || 'Production';
+    let updatedStatus = 'pending';
+
+    if (remainingLogs.length > 0 && remainingLogs[0]) {
+      updatedStage = remainingLogs[0].stage;
+      updatedStatus = 'completed';
+    }
+
+    const updatedPiece = await prisma.piece.update({
+      where: { id: piece.id },
+      data: {
+        stage: updatedStage,
+        status: updatedStatus
+      }
+    });
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_v2');
+
+    res.json({
+      success: true,
+      message: `Piece #${piece.pieceNumber} reverted successfully!`,
+      piece: updatedPiece
+    });
+  } catch (error: any) {
+    console.error('Quick revert piece error:', error);
+    res.status(500).json({ message: error.message || 'Server error reverting piece' });
+  }
+});
+
+// Quick Edit Piece Log (Edit Action)
+router.patch('/quick-edit-piece-log', authenticate, async (req: any, res: any) => {
+  try {
+    const { slabId, pieceId, machineId, driverName, photoUrl, remarks, productName, size, status, startTime, endTime } = req.body;
+    if (!slabId) {
+      return res.status(400).json({ message: 'slabId is required' });
+    }
+
+    const slab = await prisma.slab.findUnique({
+      where: { id: slabId },
+      include: { pieces: { orderBy: { pieceNumber: 'desc' } } }
+    });
+
+    if (!slab) {
+      return res.status(404).json({ message: 'Slab not found' });
+    }
+
+    let piece: any = null;
+    if (pieceId) {
+      piece = slab.pieces.find((p: any) => p.id === pieceId);
+    } else {
+      piece = slab.pieces.find((p: any) => p.status === 'completed' || p.status === 'approved') || slab.pieces[0];
+    }
+
+    if (!piece) {
+      return res.status(400).json({ message: 'Piece not found' });
+    }
+
+    const pieceUpdateData: any = {};
+    if (productName !== undefined) pieceUpdateData.productName = productName;
+    if (size !== undefined) pieceUpdateData.size = size;
+    if (status !== undefined) {
+      const targetStatus = (status === 'pending' || status === 'not_started') ? 'pending' : 'completed';
+      pieceUpdateData.status = targetStatus;
+      if (targetStatus === 'pending') {
+        await prisma.pieceLog.deleteMany({ where: { pieceId: piece.id } }).catch(() => {});
+        await prisma.productionLog.deleteMany({
+          where: {
+            OR: [
+              { pieceIds: { has: piece.id } },
+              { productId: piece.id }
+            ]
+          }
+        }).catch(() => {});
+      }
+    }
+
+    if (Object.keys(pieceUpdateData).length > 0) {
+      piece = await prisma.piece.update({
+        where: { id: piece.id },
+        data: pieceUpdateData
+      });
+    }
+
+    // Sync slab status
+    const allPieces = await prisma.piece.findMany({ where: { slabId: slab.id } });
+    const completedCount = allPieces.filter(p => p.status === 'completed').length;
+    let newSlabStatus = 'not_started';
+    if (completedCount === allPieces.length && allPieces.length > 0) {
+      newSlabStatus = 'completed';
+    } else if (completedCount > 0) {
+      newSlabStatus = 'in_production';
+    }
+    await prisma.slab.update({
+      where: { id: slab.id },
+      data: { status: newSlabStatus }
+    }).catch(() => {});
+
+    // Find latest log for this piece
+    let pieceLog = await prisma.pieceLog.findFirst({
+      where: { pieceId: piece.id },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const nowEdit = new Date();
+    const parseEditTime = (val: any, fallback: Date): Date => {
+      if (!val) return fallback;
+      const str = String(val).trim();
+      const d = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(str)
+        ? new Date(`${str}+05:30`)
+        : new Date(str);
+      if (isNaN(d.getTime()) || d.getTime() > nowEdit.getTime() + 60000) return fallback;
+      return d;
+    };
+
+    if (pieceLog) {
+      pieceLog = await prisma.pieceLog.update({
+        where: { id: pieceLog.id },
+        data: {
+          machineId: machineId !== undefined ? (machineId ? String(machineId) : null) : undefined,
+          driverName: driverName !== undefined ? driverName : undefined,
+          endPhotoUrl: photoUrl !== undefined ? photoUrl : undefined,
+          startPhotoUrl: photoUrl !== undefined ? photoUrl : undefined,
+          remarks: remarks !== undefined ? remarks : undefined,
+          startTime: startTime ? parseEditTime(startTime, nowEdit) : undefined,
+          endTime: nowEdit
+        }
+      });
+    }
+
+    // Also update corresponding ProductionLog if exists
+    try {
+      const prodLog = await prisma.productionLog.findFirst({
+        where: { slabId: slab.id, pieceIds: { has: piece.id } },
+        orderBy: { createdAt: 'desc' }
+      });
+      if (prodLog) {
+        await prisma.productionLog.update({
+          where: { id: prodLog.id },
+          data: {
+            machineId: machineId !== undefined ? (machineId ? String(machineId) : null) : undefined,
+            remarks: remarks || (driverName ? `Driver: ${driverName}` : undefined)
+          }
+        });
+      }
+    } catch (err) {
+      console.warn('ProductionLog update warning:', err);
+    }
+
+    // Update / Create MachineLog for LogBook
+    if (machineId) {
+      try {
+        const parsedStartTime = parseEditTime(startTime, nowEdit);
+        const parsedEndTime = nowEdit;
+        const durationHours = Math.max(0.1, (parsedEndTime.getTime() - parsedStartTime.getTime()) / (1000 * 60 * 60));
+
+        const existingMLog = await prisma.machineLog.findFirst({
+          where: { productId: piece.id, machineId: String(machineId) },
+          orderBy: { createdAt: 'desc' }
+        });
+        if (existingMLog) {
+          await prisma.machineLog.update({
+            where: { id: existingMLog.id },
+            data: {
+              startTime: parsedStartTime,
+              endTime: parsedEndTime,
+              actualRunHours: durationHours,
+              operatorName: driverName || undefined,
+              remarks: remarks || undefined
+            }
+          });
+        } else {
+          await prisma.machineLog.create({
+            data: {
+              machineId: String(machineId),
+              projectId: slab.projectId,
+              productId: piece.id,
+              productName: piece.productName || slab.name,
+              operatorName: driverName || 'Admin User',
+              startTime: parsedStartTime,
+              endTime: parsedEndTime,
+              actualRunHours: durationHours,
+              quantityProduced: 1,
+              status: 'completed',
+              approvalStatus: 'approved',
+              remarks: remarks || undefined
+            }
+          });
+        }
+        fastCache.invalidate('all_machine_logs');
+        fastCache.invalidate('daily_machine_logs');
+      } catch (mErr) {
+        console.warn('MachineLog update warning in quick-edit:', mErr);
+      }
+    }
+
+    fastCache.invalidate('prod_');
+    fastCache.invalidate('all_projects');
+    fastCache.invalidate('slabs_project_');
+    fastCache.invalidate('project_hierarchy_v2');
+
+    res.json({
+      success: true,
+      message: 'Piece details updated successfully',
+      piece,
+      log: pieceLog
+    });
+  } catch (error: any) {
+    console.error('Quick edit piece error:', error);
+    res.status(500).json({ message: error.message || 'Server error editing piece log' });
+  }
+});
+
+// GET Quick Piece Details (to pre-fill Edit Dialog)
+router.get('/quick-piece-details/:slabId', authenticate, async (req: any, res: any) => {
+  try {
+    const { slabId } = req.params;
+    const slab = await prisma.slab.findUnique({
+      where: { id: slabId },
+      include: {
+        pieces: {
+          orderBy: { pieceNumber: 'desc' },
+          include: {
+            logs: {
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+              include: { machine: { select: { id: true, name: true } } }
+            }
+          }
+        }
+      }
+    });
+
+    if (!slab) {
+      return res.status(404).json({ message: 'Slab not found' });
+    }
+
+    // Find the latest completed piece (or the first piece)
+    const completedPiece = slab.pieces.find((p: any) => p.status === 'completed' || p.status === 'approved') || slab.pieces[0];
+    const latestLog = completedPiece?.logs?.[0] || null;
+
+    res.json({
+      slabId: slab.id,
+      slabName: slab.name,
+      piece: completedPiece,
+      latestLog,
+      machineId: latestLog?.machineId || null,
+      machineName: latestLog?.machine?.name || '',
+      driverName: latestLog?.driverName || '',
+      photoUrl: latestLog?.endPhotoUrl || latestLog?.startPhotoUrl || '',
+      remarks: latestLog?.remarks || ''
+    });
+  } catch (error: any) {
+    console.error('Error fetching quick piece details:', error);
+    res.status(500).json({ message: error.message || 'Server error fetching piece details' });
+  }
+});
+
+export default router;
+

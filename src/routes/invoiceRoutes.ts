@@ -1,0 +1,97 @@
+import { Router } from 'express';
+import { prisma } from '../index';
+import { authenticate } from '../middlewares/authMiddleware';
+import { fastCache } from '../utils/fastCache';
+
+const router = Router();
+
+// Get invoices
+router.get('/', authenticate, async (req, res) => {
+  try {
+    const cached = fastCache.get('all_invoices');
+    if (cached) return res.json(cached);
+
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const rawInvoices = await db.collection('Invoice').find({}).sort({ createdAt: -1 }).toArray();
+        const projIds = rawInvoices.map((i: any) => i.projectId).filter(Boolean);
+        const projObjIds = projIds.filter((pId: string) => mongoose.Types.ObjectId.isValid(pId)).map((pId: string) => new mongoose.Types.ObjectId(pId));
+
+        const rawProjects = await db.collection('Project').find({ $or: [{ _id: { $in: projObjIds } }, { id: { $in: projIds } }] }, { projection: { name: 1, projectId: 1 } }).toArray();
+        const projMap = new Map();
+        rawProjects.forEach((p: any) => projMap.set(p._id.toString(), { projectId: p.projectId, name: p.name }));
+
+        const enriched = rawInvoices.map((inv: any) => ({
+          ...inv,
+          id: inv._id.toString(),
+          project: inv.projectId ? projMap.get(inv.projectId) || null : null
+        }));
+
+        fastCache.set('all_invoices', enriched, 120);
+        return res.json(enriched);
+      } catch (mErr) {
+        console.warn('Mongoose invoices fetch failed:', mErr);
+      }
+    }
+
+    const invoices = await prisma.invoice.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: { project: { select: { projectId: true, name: true } } }
+    });
+    fastCache.set('all_invoices', invoices, 120);
+    res.json(invoices);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching invoices' });
+  }
+});
+
+// Create Invoice
+router.post('/', authenticate, async (req, res) => {
+  try {
+        const { projectId, totalAmount, advancePaid, dueDate, paymentMethod, paymentDate } = req.body;
+    
+    const latestInvoice = await prisma.invoice.findFirst({
+      orderBy: { invoiceNumber: 'desc' },
+      select: { invoiceNumber: true }
+    });
+    let nextNumber = 1;
+    if (latestInvoice && latestInvoice.invoiceNumber) {
+      const match = latestInvoice.invoiceNumber.match(/INV-\d{4}-(\d+)/);
+      if (match && match[1]) {
+        nextNumber = parseInt(match[1], 10) + 1;
+      }
+    }
+    const invoiceNumber = `INV-${new Date().getFullYear()}-${String(nextNumber).padStart(4, '0')}`;
+    const balanceAmount = Number(totalAmount) - Number(advancePaid || 0);
+    
+    let status = 'unpaid';
+    if (balanceAmount <= 0) status = 'paid';
+    else if (Number(advancePaid) > 0) status = 'partial';
+
+    const newInvoice = await prisma.invoice.create({
+      data: {
+        projectId,
+        invoiceNumber,
+        totalAmount: Number(totalAmount),
+        advancePaid: Number(advancePaid || 0),
+        balanceAmount,
+        dueDate: dueDate ? new Date(dueDate) : null,
+        paymentMethod,
+        paymentDate: paymentDate ? new Date(paymentDate) : null,
+        status
+      }
+    });
+    
+    fastCache.invalidate('all_invoices');
+    fastCache.invalidate('dashboard_summary');
+    res.status(201).json(newInvoice);
+  } catch (error) {
+    console.error('Invoice creation error:', error);
+    res.status(500).json({ message: 'Server error creating invoice' });
+  }
+});
+
+export default router;

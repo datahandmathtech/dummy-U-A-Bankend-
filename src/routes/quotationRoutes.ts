@@ -1,0 +1,262 @@
+import { Router } from 'express';
+import { prisma } from '../index';
+import { authenticate } from '../middlewares/authMiddleware';
+import {
+  syncSlabsAndQuotationFromProducts,
+  ensureMergedProductsForProject,
+  invalidateProjectCaches
+} from '../utils/projectSync';
+
+const router = Router();
+
+// Get quotations by project
+router.get('/project/:projectId', authenticate, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const pObjId = mongoose.Types.ObjectId.isValid(projectId) ? new mongoose.Types.ObjectId(projectId) : null;
+        const projQuery = pObjId
+          ? { $or: [{ projectId: String(projectId) }, { projectId: pObjId }] }
+          : { projectId: String(projectId) };
+
+        const [rawQuotes, rawSlabs] = await Promise.all([
+          db.collection('Quotation').find(projQuery).sort({ createdAt: -1 }).toArray(),
+          db.collection('Slab').find(projQuery).sort({ createdAt: 1 }).toArray()
+        ]);
+        const formattedQuotes = rawQuotes.map((q: any) => ({ ...q, id: q._id.toString() }));
+        const formattedSlabs = rawSlabs.map((s: any) => ({ ...s, id: s._id.toString() }));
+        const { quotations: mergedQuotes } = ensureMergedProductsForProject(
+          String(projectId),
+          formattedSlabs,
+          formattedQuotes
+        );
+        return res.json(mergedQuotes);
+      } catch (mErr) {
+        console.warn('Mongoose quotations fetch failed:', mErr);
+      }
+    }
+
+    const quotations = await prisma.quotation.findMany({
+      where: { projectId: String(projectId) },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(quotations);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching quotations' });
+  }
+});
+
+// Get all saved quotation terms
+router.get('/terms', authenticate, async (req, res) => {
+  try {
+    const mongoose = require('mongoose');
+    let db = mongoose.connection?.db;
+
+    if (db) {
+      try {
+        const rawTerms = await db.collection('QuotationTerm').find({}).sort({ createdAt: -1 }).toArray();
+        return res.json(rawTerms.map((t: any) => ({ id: t._id.toString(), text: t.text, createdAt: t.createdAt })));
+      } catch (mErr) {
+        console.warn('Mongoose terms fetch failed:', mErr);
+      }
+    }
+
+    const terms = await prisma.quotationTerm.findMany({
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(terms);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error fetching quotation terms' });
+  }
+});
+
+// Add a new quotation term
+router.post('/terms', authenticate, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ message: 'Text is required' });
+    
+    // Upsert or just create, ignoring if it exists
+    const term = await prisma.quotationTerm.upsert({
+      where: { text },
+      update: {},
+      create: { text }
+    });
+    res.json(term);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error adding quotation term' });
+  }
+});
+
+// Create Quotation
+router.post('/', authenticate, async (req, res) => {
+  try {
+    const { 
+      projectId, marginPercentage, products, additionalCosts, terms, globalCosts
+    } = req.body;
+    
+    // Calculate products total if available
+    const productsTotal = products && Array.isArray(products) 
+      ? products.reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0)
+      : 0;
+
+    // Calculate additional costs total and map to standard columns for backward compatibility
+    let additionalCostsList: any[] = [];
+    if (Array.isArray(additionalCosts)) {
+      additionalCostsList = additionalCosts;
+    } else if (additionalCosts && typeof additionalCosts === 'object') {
+      Object.values(additionalCosts).forEach((costs: any) => {
+        if (Array.isArray(costs)) {
+          additionalCostsList = additionalCostsList.concat(costs);
+        }
+      });
+    }
+
+    const additionalTotal = additionalCostsList.reduce((sum: number, item: any) => sum + Number(item.amount || 0), 0);
+
+    let matCost = 0, cCost = 0, hcCost = 0, inCost = 0, polCost = 0, packCost = 0, transCost = 0, instCost = 0;
+    additionalCostsList.forEach((item: any) => {
+      const name = (item.name || '').toLowerCase().trim();
+      const amount = Number(item.amount || 0);
+      if (name === 'material cost') matCost = amount;
+      else if (name === 'cnc cost') cCost = amount;
+      else if (name === 'hand carving cost') hcCost = amount;
+      else if (name === 'inlay cost') inCost = amount;
+      else if (name === 'polishing cost') polCost = amount;
+      else if (name === 'packing cost') packCost = amount;
+      else if (name === 'transport cost') transCost = amount;
+      else if (name === 'installation cost') instCost = amount;
+    });
+
+    const totalCost = productsTotal + additionalTotal;
+    
+    let globalCostsTotal = 0;
+    let gstPercent = 0;
+    if (globalCosts) {
+      if (globalCosts.packageCostEnabled) globalCostsTotal += Number(globalCosts.packageCost || 0);
+      if (globalCosts.transportCostEnabled) globalCostsTotal += Number(globalCosts.transportCost || 0);
+      gstPercent = Number(globalCosts.gstPercent || 0);
+    }
+    const subTotal = totalCost + globalCostsTotal;
+    // Fallback to marginPercentage if gstPercent is 0 just in case old code sends it
+    const effectiveGst = gstPercent > 0 ? gstPercent : Number(marginPercentage || 0);
+    const finalAmountWithGst = Math.round(subTotal + ((subTotal * effectiveGst) / 100));
+
+    const newQuotation = await prisma.quotation.create({
+      data: {
+        projectId,
+        materialCost: matCost,
+        cncCost: cCost,
+        handCarvingCost: hcCost,
+        inlayCost: inCost,
+        polishingCost: polCost,
+        packingCost: packCost,
+        transportCost: transCost,
+        installationCost: instCost,
+        marginPercentage: effectiveGst,
+        totalCost,
+        finalAmount: finalAmountWithGst,
+        products: products || [],
+        additionalCosts: additionalCosts || {},
+        terms: terms || [],
+        globalCosts: globalCosts || {},
+        status: 'draft'
+      },
+      include: {
+        project: true
+      }
+    });
+
+    const activeStatuses = ['shop_drawing', 'material_planning', 'production', 'work_order', 'completed'];
+    if (
+      projectId &&
+      Array.isArray(products) &&
+      products.length > 0 &&
+      (newQuotation.project?.isDirectWorkOrder || (newQuotation.project?.status && activeStatuses.includes(newQuotation.project.status)))
+    ) {
+      await syncSlabsAndQuotationFromProducts(String(projectId), products, {
+        removeUnmatchedSlabs: false,
+        updateQuotationRecord: true
+      }).catch((e) => console.error('Sync slabs on quotation create error:', e));
+    }
+
+    invalidateProjectCaches(projectId ? String(projectId) : undefined);
+    res.status(201).json(newQuotation);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error creating quotation' });
+  }
+});
+
+// Update Quotation products
+router.patch('/:id', authenticate, async (req: any, res: any) => {
+  try {
+    const { id } = req.params;
+    const { products, additionalCosts, terms, globalCosts } = req.body;
+
+    const productsTotal = products && Array.isArray(products)
+      ? products.reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0)
+      : 0;
+
+    let additionalCostsList: any[] = [];
+    if (Array.isArray(additionalCosts)) {
+      additionalCostsList = additionalCosts;
+    } else if (additionalCosts && typeof additionalCosts === 'object') {
+      Object.values(additionalCosts).forEach((costs: any) => {
+        if (Array.isArray(costs)) additionalCostsList = additionalCostsList.concat(costs);
+      });
+    }
+
+    const additionalTotal = additionalCostsList.reduce((sum: number, item: any) => sum + Number(item.amount || 0), 0);
+    const totalCost = productsTotal + additionalTotal;
+    
+    let globalCostsTotal = 0;
+    let gstPercent = 0;
+    if (globalCosts) {
+      if (globalCosts.packageCostEnabled) globalCostsTotal += Number(globalCosts.packageCost || 0);
+      if (globalCosts.transportCostEnabled) globalCostsTotal += Number(globalCosts.transportCost || 0);
+      gstPercent = Number(globalCosts.gstPercent || 0);
+    }
+    const subTotal = totalCost + globalCostsTotal;
+    const finalAmountWithGst = Math.round(subTotal + ((subTotal * gstPercent) / 100));
+
+    const updated = await prisma.quotation.update({
+      where: { id: String(id) },
+      data: {
+        products: products || [],
+        ...(additionalCosts !== undefined ? { additionalCosts } : {}),
+        ...(terms !== undefined ? { terms } : {}),
+        ...(globalCosts !== undefined ? { globalCosts } : {}),
+        totalCost,
+        finalAmount: finalAmountWithGst,
+      },
+      include: {
+        project: {
+          include: { slabs: true }
+        }
+      }
+    });
+
+    // Always sync Slabs when quotation products are updated on an active or direct work order
+    const activeStatuses = ['shop_drawing', 'material_planning', 'production', 'work_order', 'completed'];
+    const isActiveOrDirect = updated.project?.isDirectWorkOrder || (updated.project?.status && activeStatuses.includes(updated.project.status));
+
+    if (isActiveOrDirect && Array.isArray(products)) {
+      await syncSlabsAndQuotationFromProducts(updated.projectId, products, {
+        removeUnmatchedSlabs: true,
+        updateQuotationRecord: true
+      }).catch((e) => console.error('Error syncing slabs from quotation update:', e));
+    }
+
+    invalidateProjectCaches(updated.projectId);
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error updating quotation' });
+  }
+});
+
+export default router;
